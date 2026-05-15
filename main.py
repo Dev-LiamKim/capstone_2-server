@@ -1,10 +1,12 @@
-# main.py (수정본)
 import sys
 import time
 import csv
 import numpy as np
+import os
 from pyqtgraph.Qt import QtWidgets, QtCore
-from config import SERVER_PORT, CHANNELS, WINDOW_SIZE, BATCH_SIZE
+from pynput import keyboard
+from scipy import signal
+from config import SERVER_PORT, CHANNELS, WINDOW_SIZE, BATCH_SIZE, RIGHT_HAND_KEYS
 from network import EMGReceiver
 from gui import EMGVisualizer
 
@@ -14,18 +16,20 @@ class EMGApp:
         self.receiver = EMGReceiver(SERVER_PORT)
         self.visualizer = EMGVisualizer()
         
-        # 데이터 관리 변수
         self.data_buffer = np.zeros((CHANNELS, WINDOW_SIZE))
         self.is_recording = False
-        self.recording_data = [] # 기록용 리스트
-        
-        # 성능 측정 변수
-        self.sample_count = 0
-        self.last_time = time.time()
+        self.pending_event = 0
+        self.csv_file = None
+        self.csv_writer = None
 
-        # GUI 키 이벤트 연결
-        self.visualizer.win.keyPressEvent = self.handle_key_press
-        
+        # 노치 필터 계수 (60Hz 제거)
+        fs, f0, Q = 400.0, 60.0, 30.0
+        self.b, self.a = signal.iirnotch(f0, Q, fs=fs)
+
+        # 전역 키보드 리스너 (포커스 무관)
+        self.listener = keyboard.Listener(on_press=self.on_key_press)
+        self.listener.start()
+
         self.visualizer.show()
         self.receiver.wait_for_connection()
 
@@ -33,64 +37,77 @@ class EMGApp:
         self.timer.timeout.connect(self.process)
         self.timer.start(10)
 
-    def handle_key_press(self, event):
-        # Space 바 클릭 시 기록 토글
-        if event.key() == QtCore.Qt.Key_Space:
-            if not self.is_recording:
-                self.start_recording()
+    def on_key_press(self, key):
+        """OS 전역 키 입력 캡처 및 기록 제어"""
+        try:
+            # 1. 기록 제어 핫키
+            if key == keyboard.Key.f9:
+                if not self.is_recording:
+                    self.start_full_recording()
+                return
+            elif key == keyboard.Key.f10:
+                if self.is_recording:
+                    self.stop_full_recording()
+                return
+
+            # 2. 문자 및 특수키 라벨링
+            if hasattr(key, 'char') and key.char:
+                k = key.char.lower()
             else:
-                self.stop_recording()
+                k = str(key).replace('Key.', '')
+            
+            if k in RIGHT_HAND_KEYS:
+                self.pending_event = RIGHT_HAND_KEYS[k]
+        except Exception as e:
+            print(f"Key Error: {e}")
 
-    def start_recording(self):
+    def start_full_recording(self):
+        """데이터 기록 시작 및 파일 생성"""
+        # dataset 폴더 생성 및 경로 설정
+        dir_name = "dataset"
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name)
+
         self.is_recording = True
-        self.recording_data = []
-        print("[RECORD] 기록 시작... (중단: Space)")
+        # 파일 경로를 dataset 폴더 내부로 지정
+        filename = os.path.join(dir_name, f"emg_session_{int(time.time())}.csv")
+        self.csv_file = open(filename, mode='w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([f"CH{i}" for i in range(CHANNELS)] + ["Event"])
+        print(f"[START] 기록 시작: {filename} (F10을 눌러 종료)")
 
-    def stop_recording(self):
+    def stop_full_recording(self):
+        """데이터 기록 중단 및 파일 저장"""
         self.is_recording = False
-        filename = f"emg_data_{int(time.time())}.csv"
-        self.save_to_csv(filename)
-        print(f"[RECORD] 기록 종료 및 저장 완료: {filename}")
-
-    def save_to_csv(self, filename):
-        if not self.recording_data:
-            return
-        
-        # 수집된 데이터를 (Total_Samples, Channels) 형태로 변환
-        full_data = np.vstack(self.recording_data)
-        
-        with open(filename, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            # 헤더 작성
-            writer.writerow([f"CH{i}" for i in range(CHANNELS)])
-            # 데이터 작성
-            writer.writerows(full_data)
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+        print("[STOP] 기록 종료 및 파일 저장 완료 (F9를 눌러 재시작)")
 
     def process(self):
         batch = self.receiver.receive_batch()
         if batch is not None:
-            # 시각화 버퍼 업데이트 (8, BATCH_SIZE) -> (BATCH_SIZE, 8) 전치 후 사용
-            batch_t = batch.T
             self.data_buffer = np.roll(self.data_buffer, -BATCH_SIZE, axis=1)
             self.data_buffer[:, -BATCH_SIZE:] = batch
             
-            # 기록 중인 경우 데이터 저장
-            if self.is_recording:
-                self.recording_data.append(batch_t)
+            # 시각화용 필터링
+            processed = np.array([signal.lfilter(self.b, self.a, ch - np.mean(ch)) for ch in self.data_buffer])
             
-            # Hz 측정 및 UI 업데이트 로직 (생략)
-            self.sample_count += BATCH_SIZE
-            now = time.time()
-            if now - self.last_time >= 1.0:
-                hz = self.sample_count / (now - self.last_time)
-                self.visualizer.win.setWindowTitle(f"EMG Monitor - {hz:.2f} Hz {'[REC]' if self.is_recording else ''}")
-                self.sample_count = 0
-                self.last_time = now
+            if self.is_recording:
+                events = np.zeros((BATCH_SIZE, 1), dtype=int)
+                if self.pending_event != 0:
+                    events[0] = self.pending_event
+                    self.pending_event = 0
+                self.csv_writer.writerows(np.hstack((batch.T, events)))
 
-            self.visualizer.update_charts(self.data_buffer)
+            self.visualizer.update_charts(self.data_buffer, processed)
 
     def run(self):
-        sys.exit(self.app.exec_())
+        try:
+            sys.exit(self.app.exec_())
+        finally:
+            self.stop_full_recording()
 
 if __name__ == "__main__":
     EMGApp().run()
