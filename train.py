@@ -14,7 +14,7 @@ NUM_CHANNELS = CHANNELS  # EMG 입력 채널 수 (8채널)
 # 기존 ID 예시: 'y': 11, 'space': 41 -> 변환: 0, 1, 2... 형태로 압축
 raw_labels = sorted(list(set(RIGHT_HAND_KEYS.values())))
 label_to_idx = {raw_id: idx for idx, raw_id in enumerate(raw_labels)}
-idx_to_label = {idx: raw_id for raw_id in enumerate(raw_labels)}
+idx_to_label = {idx: raw_id for idx, raw_id in enumerate(raw_labels)}
 NUM_CLASSES = len(raw_labels)  # 총 분류 대상 키 개수
 
 # ==============================================================================
