@@ -15,9 +15,9 @@ RIGHT_HAND_KEYS = {
     'n': 31, 'm': 32, ',': 33, '.': 34, '/': 35,
     
     # 특수 키 (pynput.keyboard.Key 명칭 대응)
-    'space': 41,
-    'enter': 42,
-    'backspace': 43,
-    'shift': 44,
-    'shift_r': 44
+    # 'space': 41,
+    # 'enter': 42,
+    # 'backspace': 43,
+    # 'shift': 44,
+    # 'shift_r': 44
 }
