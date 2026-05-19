@@ -1,5 +1,7 @@
 # typing_practice.py
 import random 
+import os
+import time
 from pyqtgraph.Qt import QtWidgets, QtCore, QtGui 
 from config import RIGHT_HAND_KEYS
 
@@ -105,13 +107,20 @@ class TypingWindow(QtWidgets.QWidget):
             self.entry.blockSignals(False)
             return
 
+        # [수정 영역] 자동 기록 플래그 탐지 시 타임스탬프 파일명을 생성하여 매개변수 주입 전달
         if self.app and not self.app.is_recording and self.current_cycle == 1 and self.keys_in_cycle == 0:
-            self.app.start_full_recording()
+            os.makedirs("dataset", exist_ok=True)
+            current_timestamp = time.strftime("%Y%m%d_%H%M%S")
+            generated_filename = f"dataset/recording_{current_timestamp}.csv"
+            
+            # 파라미터 유실 에러(TypeError) 차단 완료
+            self.app.start_full_recording(generated_filename)
 
         if text == self.target_text:
             # 정해진 타겟 입력 성공 시에만 이벤트 마커 전송
             if self.app:
                 self.app.pending_event = RIGHT_HAND_KEYS.get(text, 0)
+                self.app.pending_event_counter = self.app.last_packet_counter # <-- [여기에 추가]
 
             self.keys_in_cycle += 1
             
