@@ -1,3 +1,4 @@
+# main.py
 import sys
 import time
 import csv
@@ -5,7 +6,11 @@ import numpy as np
 import os
 from pyqtgraph.Qt import QtWidgets, QtCore
 from scipy import signal
-from config import SERVER_PORT, CHANNELS, WINDOW_SIZE, BATCH_SIZE
+from config import (
+    SERVER_PORT, CHANNELS, WINDOW_SIZE, BATCH_SIZE,
+    NOTCH_F0, NOTCH_Q, TIMER_INTERVAL_MS, HZ_CHECK_INTERVAL,
+    HZ_HISTORY_DURATION, HZ_THRESHOLD_LOW
+)
 from network import EMGReceiver
 from gui import EMGVisualizer
 from typing_practice import TypingWindow 
@@ -21,7 +26,6 @@ class EMGApp:
         self.is_recording = False
         self.pending_event = 0
         
-        # 메모리 버퍼 및 타겟 경로 보존 변수
         self.recorded_chunks = []
         self.target_filename = ""
 
@@ -29,8 +33,8 @@ class EMGApp:
         self.last_hz_update = time.time()
         self.sample_counter = 0
 
-        fs, f0, Q = 400.0, 60.0, 30.0
-        self.b, self.a = signal.iirnotch(f0, Q, fs=fs)
+        fs = 400.0  
+        self.b, self.a = signal.iirnotch(NOTCH_F0, NOTCH_Q, fs=fs)
 
         self.visualizer.show()
         self.typing_win.show() 
@@ -38,7 +42,7 @@ class EMGApp:
 
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.process)
-        self.timer.start(10)
+        self.timer.start(TIMER_INTERVAL_MS)
 
     def start_full_recording(self, filename):
         self.is_recording = True
@@ -71,11 +75,11 @@ class EMGApp:
             current_time = time.time()
             elapsed_interval = current_time - self.last_hz_update
             
-            if elapsed_interval >= 0.5:
+            if elapsed_interval >= HZ_CHECK_INTERVAL:
                 self.hz_history.append((self.sample_counter, elapsed_interval, current_time))
                 self.sample_counter = 0
                 self.last_hz_update = current_time
-                self.hz_history = [record for record in self.hz_history if current_time - record[2] <= 10.0]
+                self.hz_history = [record for record in self.hz_history if current_time - record[2] <= HZ_HISTORY_DURATION]
                 
                 if self.hz_history:
                     total_samples = sum(record[0] for record in self.hz_history)
@@ -83,13 +87,24 @@ class EMGApp:
                     if total_time > 0:
                         moving_avg_hz = total_samples / total_time
                         self.visualizer.lbl_fps.setText(f"평균 Sampling Rate (최근 10초): {moving_avg_hz:.2f} Hz")
-
+                        
+                        if moving_avg_hz < HZ_THRESHOLD_LOW:
+                            self.typing_win.entry.setDisabled(True)
+                            self.typing_win.lbl_status.setText("네트워크 지연 발생: 수신 속도 저하로 입력을 제한합니다.")
+                            self.typing_win.lbl_status.setStyleSheet("color: orange; font-weight: bold;")
+                        else:
+                            if self.typing_win.current_cycle <= self.typing_win.max_cycles:
+                                self.typing_win.entry.setDisabled(False)
+                                self.typing_win.entry.setFocus()  
+                                # 속도 복구 시 하단 레이블 메시지 및 가독성 색상 상태 업데이트 추가
+                                self.typing_win.lbl_status.setText("정상 속도 복구: 입력 가능 상태입니다.")
+                                self.typing_win.lbl_status.setStyleSheet("color: green; font-weight: normal;")
+                                
             self.data_buffer = np.roll(self.data_buffer, -BATCH_SIZE, axis=1)
             self.data_buffer[:, -BATCH_SIZE:] = batch
             
             processed = np.array([signal.lfilter(self.b, self.a, ch - np.mean(ch)) for ch in self.data_buffer])
             
-            # 디스크 쓰기 연산을 전면 배제하고 파이썬 리스트 메모리 버퍼에 임시 적재
             if self.is_recording:
                 events = np.zeros((BATCH_SIZE, 1), dtype=int)
                 if self.pending_event != 0:
