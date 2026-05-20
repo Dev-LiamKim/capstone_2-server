@@ -1,4 +1,3 @@
-# typing_practice.py
 import random 
 import os
 import time
@@ -6,7 +5,6 @@ from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 from config import RIGHT_HAND_KEYS
 
 class TypingWindow(QtWidgets.QWidget):
-    """1사이클을 총 50회 반복하며 오타 시 데이터 기록을 방지하는 자리 연습 창"""
     def __init__(self, app_reference=None):
         super().__init__()
         self.app = app_reference  
@@ -14,19 +12,16 @@ class TypingWindow(QtWidgets.QWidget):
         self.resize(550, 250)
         self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint)
 
-        # 1. 대상 단일 문자 풀 추출 (총 19개 키)
         self.char_pool = [k for k in RIGHT_HAND_KEYS.keys() if len(k) == 1]
         self.pool_size = len(self.char_pool)
         self.practice_queue = []
         
-        # 사이클 제어 변수 (50사이클 반복 설정)
         self.current_cycle = 1
         self.max_cycles = 50
         self.keys_in_cycle = 0
         
         layout = QtWidgets.QVBoxLayout()
         
-        # 진행도 표시 레이블
         self.lbl_instr = QtWidgets.QLabel(f"제시된 글자를 누르세요 (진행도: {self.current_cycle}/{self.max_cycles} 사이클 | {self.keys_in_cycle}/{self.pool_size})")
         self.lbl_instr.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         
@@ -107,20 +102,17 @@ class TypingWindow(QtWidgets.QWidget):
             self.entry.blockSignals(False)
             return
 
-        # [수정 영역] 자동 기록 플래그 탐지 시 타임스탬프 파일명을 생성하여 매개변수 주입 전달
         if self.app and not self.app.is_recording and self.current_cycle == 1 and self.keys_in_cycle == 0:
             os.makedirs("dataset", exist_ok=True)
             current_timestamp = time.strftime("%Y%m%d_%H%M%S")
             generated_filename = f"dataset/recording_{current_timestamp}.csv"
             
-            # 파라미터 유실 에러(TypeError) 차단 완료
+            # 파일 생성 없이 기록 플래그 활성화 및 파일명만 전달
             self.app.start_full_recording(generated_filename)
 
         if text == self.target_text:
-            # 정해진 타겟 입력 성공 시에만 이벤트 마커 전송
             if self.app:
                 self.app.pending_event = RIGHT_HAND_KEYS.get(text, 0)
-                self.app.pending_event_counter = self.app.last_packet_counter # <-- [여기에 추가]
 
             self.keys_in_cycle += 1
             
@@ -137,8 +129,9 @@ class TypingWindow(QtWidgets.QWidget):
                 self.lbl_next_next.setText("")
                 self.entry.setDisabled(True)
                 
+                # 성공 종료 플래그(True) 전달
                 if self.app and self.app.is_recording:
-                    self.app.stop_full_recording()
+                    self.app.stop_full_recording(success=True)
             else:
                 self.lbl_instr.setText(f"제시된 글자를 누르세요 (진행도: {self.current_cycle}/{self.max_cycles} 사이클 | {self.keys_in_cycle}/{self.pool_size})")
                 self.lbl_status.setText("정확함!")
@@ -149,7 +142,6 @@ class TypingWindow(QtWidgets.QWidget):
             self.entry.clear()
             self.entry.blockSignals(False)
         else:
-            # 오타 발생 시 이벤트 마커를 0(기록 안 함)으로 명시적 초기화
             if self.app:
                 self.app.pending_event = 0
 
@@ -159,3 +151,9 @@ class TypingWindow(QtWidgets.QWidget):
             self.entry.blockSignals(True)
             self.entry.clear()
             self.entry.blockSignals(False)
+
+    # 창을 강제로 닫을 때 실패 처리 매핑
+    def closeEvent(self, event):
+        if self.app and self.app.is_recording:
+            self.app.stop_full_recording(success=False)
+        event.accept()
