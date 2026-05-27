@@ -46,7 +46,8 @@ sympy==1.14.0
 tensorflow==2.21.0
 termcolor==3.3.0
 threadpoolctl==3.6.0
-torch==2.11.0+cu128
+--index-url https://download.pytorch.org/whl/cu124
+torch==2.11.0
 torchvision==0.26.0+cu128
 typing_extensions==4.15.0
 tzdata==2026.2
