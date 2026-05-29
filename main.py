@@ -34,7 +34,7 @@ class EMGApp:
         self.sample_counter = 0
 
         fs = 400.0  
-        self.b, self.a = signal.iirnotch(NOTCH_F0, NOTCH_Q, fs=fs)
+        # self.b, self.a = signal.iirnotch(NOTCH_F0, NOTCH_Q, fs=fs)
 
         self.visualizer.show()
         self.typing_win.show() 
@@ -103,7 +103,8 @@ class EMGApp:
             self.data_buffer = np.roll(self.data_buffer, -BATCH_SIZE, axis=1)
             self.data_buffer[:, -BATCH_SIZE:] = batch
             
-            processed = np.array([signal.lfilter(self.b, self.a, ch - np.mean(ch)) for ch in self.data_buffer])
+            # processed = np.array([signal.lfilter(self.b, self.a, ch - np.mean(ch)) for ch in self.data_buffer])
+            processed = np.array([ch - np.mean(ch) for ch in self.data_buffer])
             
             if self.is_recording:
                 events = np.zeros((BATCH_SIZE, 1), dtype=int)
