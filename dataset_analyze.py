@@ -11,7 +11,7 @@ STEP_SIZE = 10             # 슬라이딩 간격
 SHORT_TERM_LEN = 20        # 희석 방지용 말단 에너지 추출 길이 (최근 20프레임)
 THRESHOLD_MULTIPLIER = 2.5 # 기저선 대비 임계값 배수
 BASELINE_ALPHA = 0.005     # 기저선 추적 속도
-COOLDOWN_FRAMES = 100      # 타건 후 재트리거 잠금 프레임 수
+COOLDOWN_FRAMES = 80       # 타건 후 재트리거 잠금 프레임 수
 # ==============================================================================
 
 def analyze_emg_dataset(dataset_dir="new_dataset"):
@@ -63,6 +63,7 @@ def analyze_emg_dataset(dataset_dir="new_dataset"):
         baseline_energy = 0.0
         last_energy = 0.0
         is_rising = False
+        last_detected_class = None # 직전 감지 레이블 추적 변수 추가
 
         # STEP_SIZE 단위로 유입되는 실시간 파이프라인 모사
         for idx in range(0, len(norm_signal), STEP_SIZE):
@@ -97,12 +98,12 @@ def analyze_emg_dataset(dataset_dir="new_dataset"):
                 else:
                     # 임계값 돌파 구간 (기저선 동결 및 기울기 반전 추적)
                     if current_energy > last_energy:
+                        自由_rising = True
                         is_rising = True
                     elif current_energy < last_energy and is_rising:
                         if cooldown_counter == 0:
-                            total_simulated_triggers += 1
-                            
                             # 현재 윈도우 말단의 실제 Event 레이블 매핑 코드
+                            detected_class = None
                             if 'Event' in df.columns:
                                 # 윈도우 후반부의 최빈 레이블을 해당 트리거의 클래스로 간주
                                 current_sample_idx = idx + WINDOW_SIZE
@@ -111,7 +112,15 @@ def analyze_emg_dataset(dataset_dir="new_dataset"):
                                 
                                 if len(active_labels) > 0:
                                     detected_class = str(active_labels[0])
+                            
+                            # [핵심 수정] 직전 레이블과 동일한 연속 감지 건은 카운트에서 완전 제외
+                            if detected_class is not None and detected_class == last_detected_class:
+                                pass 
+                            else:
+                                total_simulated_triggers += 1
+                                if detected_class is not None:
                                     class_trigger_counts[detected_class] = class_trigger_counts.get(detected_class, 0) + 1
+                                    last_detected_class = detected_class # 직전 감지 레이블 업데이트
                             
                             cooldown_counter = COOLDOWN_FRAMES
                         is_rising = False

@@ -7,8 +7,20 @@ from network import EMGReceiver
 from config import SERVER_PORT, CHANNELS, RIGHT_HAND_KEYS
 
 # ==============================================================================
-# 1. 하이브리드 모델 아키텍처 (독립형 구조)
+# [실시간 추론 제어 튜닝 파라미터]
 # ==============================================================================
+WINDOW_SIZE = 150          
+STEP_SIZE = 10             
+SHORT_TERM_LEN = 20        
+
+THRESHOLD_MULTIPLIER = 2.5 
+BASELINE_ALPHA = 0.005     
+WARMUP_FRAMES = 800        # 실시간 글로벌 정규화 기준값 산출을 위한 초기 데이터 확보량 (400Hz 기준 2초)
+
+COOLDOWN_FRAMES = 80       
+MIN_CONFIDENCE = 0.60      
+# ==============================================================================
+
 class Attention(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
@@ -103,16 +115,7 @@ class HybridCNNLSTM(nn.Module):
         return self.classifier(combined_feats)
 
 
-# ==============================================================================
-# 2. 실시간 추론 엔진 클래스 (시뮬레이터 연동용 인라인 정규화 적용)
-# ==============================================================================
-WINDOW_SIZE = 150
-PRE_EVENT = 90
-BUFFER_SIZE = 500
-PEAK_WAIT_FRAMES = 100
-VOTING_SHIFTS = [-5, 0, 5]
-
-class RealtimeInferenceEngine:
+class ContinuousSlidingWindowEngine:
     def __init__(self, model_path='best_emg_model.pt'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
@@ -125,99 +128,101 @@ class RealtimeInferenceEngine:
         self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
         self.model.eval()
         
-        self.buffer = collections.deque(maxlen=BUFFER_SIZE)
-        self.state = 'IDLE'
-        self.wait_counter = 0
-        self.baseline_energy = 0.0
-        self.alpha = 0.01
-        
-        # [추가] 수신 체크용 총 샘플(프레임) 카운터
+        self.frame_buffer = []
+        self.cooldown_counter = 0
         self.total_samples = 0
-
-    def compute_tkeo(self, signal_2d):
-        tkeo = np.zeros_like(signal_2d)
-        tkeo[1:-1] = signal_2d[1:-1]**2 - signal_2d[:-2] * signal_2d[2:]
-        tkeo = np.clip(tkeo, 0, None)
-        return np.mean(tkeo, axis=1)
+        
+        self.is_warmed_up = False
+        self.session_mean = None
+        self.session_std = None
+        self.baseline_energy = 0.0
+        
+        self.last_energy = 0.0
+        self.is_rising = False
+        self.last_predicted_key = None 
 
     def process_stream(self, new_data_chunk):
-        # 1. 데이터를 루프 없이 한 번에 버퍼에 연장 (O(1) 처리)
-        self.buffer.extend(new_data_chunk)
-        self.total_samples += len(new_data_chunk)
-        
-        if self.total_samples % 175 < len(new_data_chunk):
-            print(f"[수신 상태 확인] 현재 {self.total_samples}프레임 수신 중...")
+        chunk_array = np.array(new_data_chunk).reshape(-1, CHANNELS)
+        self.frame_buffer.extend(chunk_array.tolist())
+        self.total_samples += chunk_array.shape[0]
 
-        if len(self.buffer) < BUFFER_SIZE: return
-
-        # 2. 배치 단위 1회 연산으로 CPU 과부하 방지
-        current_raw_data = np.array(self.buffer)
-        energy_profile = self.compute_tkeo(current_raw_data)
-        current_energy = energy_profile[-1]
-
-        if self.state == 'IDLE':
-            self.baseline_energy = (1 - self.alpha) * self.baseline_energy + self.alpha * current_energy
+        # 1. 예열 구간: 실시간 글로벌 정규화 기준 산출
+        if not self.is_warmed_up:
+            if len(self.frame_buffer) < WARMUP_FRAMES:
+                return 
             
-            # 절대 상수를 제거하고 순수 비율(4.0배)로만 검증
-            if current_energy > (self.baseline_energy * 4.0): 
-                self.state = 'WAIT_PEAK'
-                self.wait_counter = 0
-                
-        elif self.state == 'WAIT_PEAK':
-            self.wait_counter += len(new_data_chunk)
-            if self.wait_counter >= PEAK_WAIT_FRAMES:
-                self.extract_and_infer(current_raw_data, energy_profile)
-                self.state = 'COOLDOWN'
-                self.wait_counter = 0
-                
-        elif self.state == 'COOLDOWN':
-            self.wait_counter += len(new_data_chunk)
-            if self.wait_counter >= 100: 
-                self.state = 'IDLE'
+            warmup_arr = np.array(self.frame_buffer[:WARMUP_FRAMES])
+            self.session_mean = np.mean(warmup_arr, axis=0, keepdims=True)
+            self.session_std = np.std(warmup_arr, axis=0, keepdims=True) + 1e-8
+            
+            norm_warmup = (warmup_arr - self.session_mean) / self.session_std
+            tkeo_w = np.zeros_like(norm_warmup)
+            tkeo_w[1:-1] = norm_warmup[1:-1]**2 - norm_warmup[:-2] * norm_warmup[2:]
+            tkeo_w = np.mean(np.clip(tkeo_w, 0, None), axis=1)
+            self.baseline_energy = np.percentile(tkeo_w, 20) + 1e-6
+            
+            self.is_warmed_up = True
+            self.frame_buffer = self.frame_buffer[WARMUP_FRAMES:] 
+            print(f"▶ [캘리브레이션 완료] 통계적 기저선 확정: {self.baseline_energy:.4f}")
+            return
 
-    def extract_and_infer(self, current_raw_data, energy_profile):
-        search_start = BUFFER_SIZE - PEAK_WAIT_FRAMES - 30
-        peak_idx = search_start + np.argmax(energy_profile[search_start:BUFFER_SIZE])
-        base_start = peak_idx - PRE_EVENT
-        
-        ensemble_probs = []
-        
+        # 2. 정상 추론: 확정된 세션 기준값으로 실시간 정규화 처리
+        while len(self.frame_buffer) >= WINDOW_SIZE:
+            raw_window = np.array(self.frame_buffer[:WINDOW_SIZE])
+            if self.cooldown_counter > 0:
+                self.cooldown_counter = max(0, self.cooldown_counter - STEP_SIZE)
+            
+            normalized_window = (raw_window - self.session_mean) / self.session_std
+            
+            tkeo_array = np.zeros_like(normalized_window)
+            tkeo_array[1:-1] = normalized_window[1:-1]**2 - normalized_window[:-2] * normalized_window[2:]
+            tkeo_array = np.mean(np.clip(tkeo_array, 0, None), axis=1) 
+            
+            current_energy = np.mean(tkeo_array[-SHORT_TERM_LEN:])
+            
+            dynamic_threshold = self.baseline_energy * THRESHOLD_MULTIPLIER 
+
+            if current_energy < dynamic_threshold:
+                self.baseline_energy = (1 - BASELINE_ALPHA) * self.baseline_energy + BASELINE_ALPHA * current_energy
+                self.is_rising = False
+            else:
+                if current_energy > self.last_energy:
+                    self.is_rising = True
+                elif current_energy < self.last_energy and self.is_rising:
+                    if self.cooldown_counter == 0:
+                        self.execute_inference(normalized_window)
+                        self.cooldown_counter = COOLDOWN_FRAMES
+                    self.is_rising = False
+
+            self.last_energy = current_energy
+            self.frame_buffer = self.frame_buffer[STEP_SIZE:]
+
+    def execute_inference(self, normalized_window):
         with torch.no_grad():
-            for shift in VOTING_SHIFTS:
-                start_idx = base_start + shift
-                end_idx = start_idx + WINDOW_SIZE
-                if start_idx < 0 or end_idx > BUFFER_SIZE: continue
-                
-                # [핵심] 슬라이싱된 150프레임 추론 윈도우 내부에서만 독립적 Z-score 정규화 수행
-                window = current_raw_data[start_idx:end_idx]
-                w_mean = np.mean(window, axis=(0, 1), keepdims=True)
-                w_std = np.std(window, axis=(0, 1), keepdims=True) + 1e-8
-                normalized_window = (window - w_mean) / w_std
-                
-                tensor_input = torch.tensor(normalized_window, dtype=torch.float32).unsqueeze(0).to(self.device)
-                probs = torch.softmax(self.model(tensor_input), dim=1).cpu().numpy()[0]
-                ensemble_probs.append(probs)
-
-        if ensemble_probs:
-            avg_probs = np.mean(ensemble_probs, axis=0)
-            pred_idx = np.argmax(avg_probs)
-            confidence = avg_probs[pred_idx]
+            tensor_input = torch.tensor(normalized_window, dtype=torch.float32).unsqueeze(0).to(self.device)
+            logits = self.model(tensor_input)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
             
-            if confidence > 0.5: # 판정 신뢰도 기준선
+            pred_idx = np.argmax(probs)
+            confidence = probs[pred_idx]
+            
+            if confidence >= MIN_CONFIDENCE:
                 event_id = self.idx_to_label.get(pred_idx, None)
                 target_key = self.inv_key_map.get(event_id, "Unknown")
-                print(f"▶ [실시간 감지 성공] 예측 키: '{target_key}' | 신뢰도: {confidence*100:.1f}%")
+                
+                if target_key == self.last_predicted_key:
+                    return
+                
+                self.last_predicted_key = target_key
+                print(f"▶ [타건 감지] 예측 키: '{target_key}' | 신뢰도: {confidence*100:.1f}%")
 
-# ==============================================================================
-# 3. 메인 실행 루프
-# ==============================================================================
 def main_run():
     receiver = EMGReceiver(SERVER_PORT)
     receiver.wait_for_connection()
     
-    engine = RealtimeInferenceEngine()
-    print("EMG 실시간 피크 동기화 추론 엔진 가동 (하이브리드 독립형)")
-    print("※ 베이스라인 캘리브레이션을 위해 최초 1~2초간 손을 움직이지 마십시오.")
+    engine = ContinuousSlidingWindowEngine()
+    print("EMG 피크 기반 타건 추론 엔진 가동 시작")
+    print("※ 캘리브레이션을 위해 최초 2초간 손을 움직이지 마십시오.")
     
     try:
         while True:
@@ -231,3 +236,5 @@ def main_run():
 
 if __name__ == "__main__":
     main_run()
+    
+    #  데이터셋 전체분석은 전체 데이터셋 값을 기준으로 정
