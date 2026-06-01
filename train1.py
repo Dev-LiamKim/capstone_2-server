@@ -100,16 +100,20 @@ class EMGDataset(Dataset):
     
     def __getitem__(self, idx):
         x = self.X[idx]
-        # augment가 True일 때만 데이터 증강 수행
         if self.augment:
-            # 1. 가우시안 노이즈 주입 (확률 50%)
+            # 1. 가우시안 노이즈 주입
             if torch.rand(1).item() > 0.5:
                 x = x + torch.randn_like(x) * 0.01
             
-            # 2. 시간 축 롤링 (확률 50%)
+            # 2. 시간 축 무작위 롤링
             if torch.rand(1).item() > 0.5:
-                shift = torch.randint(-5, 5, (1,)).item()
+                shift = torch.randint(-8, 8, (1,)).item() # 범위 확장
                 x = torch.roll(x, shifts=shift, dims=0)
+                
+            # 3. 크기 변조(Scaling) 추가
+            if torch.rand(1).item() > 0.5:
+                scale_factor = torch.empty(1).uniform_(0.8, 1.2).item()
+                x = x * scale_factor
         return x, self.y[idx]
     
 # ==============================================================================
@@ -125,60 +129,95 @@ class Attention(nn.Module):
         context = torch.sum(lstm_output * attn_weights, dim=1)     
         return context
 
+class ResBlock1D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels)
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(x + self.block(x))
+
 class CNNLSTM(nn.Module):
     def __init__(self, num_channels, num_classes):
         super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv1d(num_channels, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Dropout(0.3),
-
-            nn.Conv1d(64, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Dropout(0.3),
+        # 입력 채널 확장을 위한 초기 투영 레이어
+        self.init_conv = nn.Sequential(
+            nn.Conv1d(num_channels, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU()
         )
+        # 잔차 연결 블록 탑재
+        self.res_block1 = ResBlock1D(128)
+        self.pool1 = nn.MaxPool1d(2)
+        
+        self.mid_conv = nn.Sequential(
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU()
+        )
+        self.res_block2 = ResBlock1D(256)
+        self.pool2 = nn.MaxPool1d(2)
+
+        # 양방향 LSTM 구성
         self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True, bidirectional=True)
         self.attention = Attention(hidden_size=256)
         self.dropout_lstm = nn.Dropout(0.4)
         
         self.classifier = nn.Sequential(
-            nn.Linear(256, 64),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(0.5), 
-            nn.Linear(64, num_classes),
+            nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
         x = x.permute(0, 2, 1)     
-        x = self.cnn(x)             
+        x = self.init_conv(x)
+        x = self.res_block1(x)
+        x = self.pool1(x)
+        
+        x = self.mid_conv(x)
+        x = self.res_block2(x)
+        x = self.pool2(x)
+        
         x = x.permute(0, 2, 1)     
         x, _ = self.lstm(x)         
         x = self.attention(x)       
         x = self.dropout_lstm(x)
         return self.classifier(x)
-
+    
 # ==============================================================================
 # 4. Focal Loss 및 훈련 유틸리티
 # ==============================================================================
+# FocalLoss 구현부 내부 또는 선언부 수정
+# nn.CrossEntropyLoss에 label_smoothing 파라미터 연동 구조 매핑 필요시 아래 형태로 대입
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.1):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        self.label_smoothing = label_smoothing
 
     def forward(self, inputs, targets):
-        ce_loss = nn.CrossEntropyLoss(weight=self.alpha, reduction='none')(inputs, targets)
+        # label_smoothing 옵션 추가
+        ce_loss = nn.CrossEntropyLoss(weight=self.alpha, reduction='none', label_smoothing=self.label_smoothing)(inputs, targets)
         pt = torch.exp(-ce_loss)
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
         
         if self.reduction == 'mean': return focal_loss.mean()
         elif self.reduction == 'sum': return focal_loss.sum()
         return focal_loss
+
+
 
 class EarlyStopping:
     def __init__(self, patience=PATIENCE, path='best_emg_model.pt'):
@@ -301,7 +340,8 @@ if __name__ == '__main__':
     class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
     class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
     
-    criterion = FocalLoss(alpha=class_weights_tensor, gamma=2.0, reduction='mean')
+    # 메인 실행부 선언 코드 대체
+    criterion = FocalLoss(alpha=class_weights_tensor, gamma=2.0, reduction='mean', label_smoothing=0.1)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_MULT, eta_min=ETA_MIN)
     
