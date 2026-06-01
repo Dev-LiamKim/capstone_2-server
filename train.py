@@ -1,6 +1,7 @@
 import os
 import glob
 import itertools
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -11,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from datetime import datetime
+from scipy import signal as scipy_signal
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from config import RIGHT_HAND_KEYS, CHANNELS
@@ -34,19 +36,77 @@ print(f"[CONFIG] 클래스 수: {NUM_CLASSES}, 디바이스: {DEVICE}")
 if DEVICE.type == 'cuda':
     print(f"[GPU] {torch.cuda.get_device_name(0)}")
 
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
 # ==============================================================================
 # 2. CSV 데이터 로딩 및 윈도우 추출
 # ==============================================================================
-def extract_windows_from_df(df):
+def extract_windows_from_df(
+    df,
+    notch_filter=False,
+    filter_mode='raw',
+    align_peak=False,
+    peak_search_before=80,
+    peak_search_after=120,
+    fs=350.0,
+    notch_f0=60.0,
+    notch_q=30.0
+):
     """이벤트 마커 기준 PRE_EVENT 이전 ~ POST_EVENT 이후 윈도우 추출"""
     ch_cols = [f"CH{i}" for i in range(NUM_CHANNELS)]
     signal  = df[ch_cols].values
+    if notch_filter and filter_mode == 'raw':
+        filter_mode = 'notch'
+
+    if filter_mode != 'raw':
+        signal = signal.astype(np.float64)
+        if filter_mode == 'notch':
+            b, a = scipy_signal.iirnotch(notch_f0, notch_q, fs=fs)
+        elif filter_mode == 'bandpass_20_150':
+            b, a = scipy_signal.butter(4, [20.0, 150.0], btype='bandpass', fs=fs)
+        elif filter_mode == 'bandpass_20_175':
+            b, a = scipy_signal.butter(4, [20.0, 174.0], btype='bandpass', fs=fs)
+        elif filter_mode == 'highpass_20':
+            b, a = scipy_signal.butter(4, 20.0, btype='highpass', fs=fs)
+        elif filter_mode == 'highpass_20_notch':
+            hb, ha = scipy_signal.butter(4, 20.0, btype='highpass', fs=fs)
+            nb, na = scipy_signal.iirnotch(notch_f0, notch_q, fs=fs)
+            signal = np.stack([
+                scipy_signal.lfilter(nb, na, scipy_signal.lfilter(hb, ha, signal[:, ch] - np.mean(signal[:, ch])))
+                for ch in range(NUM_CHANNELS)
+            ], axis=1)
+            b, a = None, None
+        else:
+            raise ValueError(f"Unsupported filter_mode: {filter_mode}")
+
+        if b is not None and a is not None:
+            signal = np.stack([
+                scipy_signal.lfilter(b, a, signal[:, ch] - np.mean(signal[:, ch]))
+                for ch in range(NUM_CHANNELS)
+            ], axis=1)
+
     events  = df[df['Event'] != 0]
 
     X_list, y_list = [], []
     for row_idx, row in events.iterrows():
-        start = row_idx - PRE_EVENT
-        end   = row_idx + POST_EVENT
+        center_idx = row_idx
+        if align_peak:
+            search_start = max(0, row_idx - peak_search_before)
+            search_end = min(len(signal), row_idx + peak_search_after + 1)
+            search_window = signal[search_start:search_end]
+            search_window = search_window - np.mean(search_window, axis=0, keepdims=True)
+            row_energy = np.sum(np.square(search_window), axis=1)
+            center_idx = search_start + int(np.argmax(row_energy))
+
+        start = center_idx - PRE_EVENT
+        end   = center_idx + POST_EVENT
         if start < 0 or end > len(signal):
             continue
         label = int(row['Event'])
@@ -58,7 +118,17 @@ def extract_windows_from_df(df):
     return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.int32)
 
 
-def load_dataset(dataset_dir='dataset'):
+def load_dataset(
+    dataset_dir='dataset',
+    notch_filter=False,
+    filter_mode='raw',
+    align_peak=False,
+    peak_search_before=80,
+    peak_search_after=120
+):
+    # 스크립트 파일 위치 기준으로 절대경로 변환 (cwd에 무관하게 동작)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    dataset_dir = os.path.join(base_dir, dataset_dir)
     csv_files = glob.glob(os.path.join(dataset_dir, '*.csv'))
     if not csv_files:
         raise FileNotFoundError(f"[ERROR] '{dataset_dir}/' 에서 CSV 파일을 찾을 수 없습니다.")
@@ -67,9 +137,16 @@ def load_dataset(dataset_dir='dataset'):
     X_all, y_all = [], []
     for path in csv_files:
         df = pd.read_csv(path)
-        X, y = extract_windows_from_df(df)
+        X, y = extract_windows_from_df(
+            df,
+            notch_filter=notch_filter,
+            filter_mode=filter_mode,
+            align_peak=align_peak,
+            peak_search_before=peak_search_before,
+            peak_search_after=peak_search_after
+        )
         if len(X) == 0:
-            print(f"  ⚠  {os.path.basename(path)}: 유효한 윈도우 없음, 건너뜀")
+            print(f"  [WARN] {os.path.basename(path)}: 유효한 윈도우 없음, 건너뜀")
             continue
         # 세션별 정규화: 세션 내 신호의 절대적 편차 제거
         # axis=(0,1) → 전체 윈도우 × 시간 축에 걸쳐 채널별 통계 계산
@@ -79,7 +156,7 @@ def load_dataset(dataset_dir='dataset'):
 
         X_all.append(X)
         y_all.append(y)
-        print(f"  ✓  {os.path.basename(path)}: {len(X)}개 윈도우 추출 (세션 정규화 완료)")
+        print(f"  [OK] {os.path.basename(path)}: {len(X)}개 윈도우 추출 (세션 정규화 완료)")
 
     X_all = np.concatenate(X_all, axis=0)
     y_all = np.concatenate(y_all, axis=0)
@@ -126,8 +203,22 @@ def augment_emg(X, y, noise_std=0.05, max_shift=5, scale_range=(0.9, 1.1), aug_f
 # ==============================================================================
 # 4. 전처리 파이프라인 (분할 → 정규화 → 증강)
 # ==============================================================================
-def preprocess(dataset_dir='dataset'):
-    X_all, y_all = load_dataset(dataset_dir)
+def preprocess(
+    dataset_dir='dataset',
+    notch_filter=False,
+    filter_mode='raw',
+    align_peak=False,
+    peak_search_before=80,
+    peak_search_after=120
+):
+    X_all, y_all = load_dataset(
+        dataset_dir,
+        notch_filter=notch_filter,
+        filter_mode=filter_mode,
+        align_peak=align_peak,
+        peak_search_before=peak_search_before,
+        peak_search_after=peak_search_after
+    )
 
     # 3-way stratified split: 70% / 15% / 15%
     X_train, X_temp, y_train, y_temp = train_test_split(
@@ -211,6 +302,51 @@ class CNNLSTM(nn.Module):
         x = x[:, -1, :]             # 마지막 타임스텝 → (B, 64)
         x = self.dropout_lstm(x)
         return self.classifier(x)   # → (B, num_classes)
+
+
+class ResidualBlock1D(nn.Module):
+    def __init__(self, channels, dropout=0.2):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=5, padding=2),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(x + self.block(x))
+
+
+class ResNet1D(nn.Module):
+    def __init__(self, num_channels, num_classes):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(num_channels, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+        )
+        self.blocks = nn.Sequential(
+            ResidualBlock1D(64, dropout=0.2),
+            ResidualBlock1D(64, dropout=0.2),
+            ResidualBlock1D(64, dropout=0.2),
+        )
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Dropout(0.4),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.stem(x)
+        x = self.blocks(x)
+        return self.head(x)
 
 
 # ==============================================================================
@@ -406,8 +542,95 @@ def save_text_report(class_names, y_true, y_pred,
 # 14. 메인 실행 (Windows 멀티프로세싱 안전을 위해 if __name__ 가드 필수)
 # ==============================================================================
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train the EMG keyboard classifier.')
+    parser.add_argument(
+        '--dataset-dir',
+        default='dataset',
+        help='CSV dataset directory to use for training. Defaults to dataset.'
+    )
+    parser.add_argument(
+        '--notch-filter',
+        action='store_true',
+        help='Apply a 60 Hz notch filter to each CSV session before window extraction.'
+    )
+    parser.add_argument(
+        '--filter-mode',
+        choices=['raw', 'notch', 'bandpass_20_150', 'bandpass_20_175', 'highpass_20', 'highpass_20_notch'],
+        default='raw',
+        help='Signal filter to apply before window extraction. Defaults to raw.'
+    )
+    parser.add_argument(
+        '--model',
+        choices=['cnn_lstm', 'resnet1d'],
+        default='cnn_lstm',
+        help='Model architecture to train. Defaults to cnn_lstm.'
+    )
+    parser.add_argument(
+        '--align-peak',
+        action='store_true',
+        help='Center each training window on the local energy peak near the event marker.'
+    )
+    parser.add_argument(
+        '--peak-search-before',
+        type=int,
+        default=80,
+        help='Samples to search before the event marker when --align-peak is enabled.'
+    )
+    parser.add_argument(
+        '--peak-search-after',
+        type=int,
+        default=120,
+        help='Samples to search after the event marker when --align-peak is enabled.'
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed for model initialization and data loading. Defaults to 42.'
+    )
+    parser.add_argument(
+        '--window-size',
+        type=int,
+        default=WINDOW_SIZE,
+        help='Number of samples per training window. Defaults to 100.'
+    )
+    parser.add_argument(
+        '--pre-event',
+        type=int,
+        default=PRE_EVENT,
+        help='Number of samples before the event marker. Defaults to 40.'
+    )
+    parser.add_argument(
+        '--max-epochs',
+        type=int,
+        default=150,
+        help='Maximum number of training epochs. Defaults to 150.'
+    )
+    parser.add_argument(
+        '--patience',
+        type=int,
+        default=15,
+        help='Early stopping patience. Defaults to 15.'
+    )
+    args = parser.parse_args()
+    set_seed(args.seed)
+
+    if args.pre_event < 0 or args.pre_event >= args.window_size:
+        raise ValueError('--pre-event must be >= 0 and smaller than --window-size')
+
+    WINDOW_SIZE = args.window_size
+    PRE_EVENT = args.pre_event
+    POST_EVENT = WINDOW_SIZE - PRE_EVENT
+
     # ── 데이터 준비 ─────────────────────────────────────────────────────────
-    X_train, X_val, X_test, y_train, y_val, y_test = preprocess()
+    X_train, X_val, X_test, y_train, y_val, y_test = preprocess(
+        args.dataset_dir,
+        notch_filter=args.notch_filter,
+        filter_mode=args.filter_mode,
+        align_peak=args.align_peak,
+        peak_search_before=args.peak_search_before,
+        peak_search_after=args.peak_search_after
+    )
 
     pin = (DEVICE.type == 'cuda')
     train_loader = DataLoader(EMGDataset(X_train, y_train),
@@ -421,21 +644,24 @@ if __name__ == '__main__':
                               num_workers=0, pin_memory=pin)
 
     # ── 모델 / 옵티마이저 / 스케줄러 ─────────────────────────────────────
-    model     = CNNLSTM(NUM_CHANNELS, NUM_CLASSES).to(DEVICE)
+    if args.model == 'resnet1d':
+        model = ResNet1D(NUM_CHANNELS, NUM_CLASSES).to(DEVICE)
+    else:
+        model = CNNLSTM(NUM_CHANNELS, NUM_CLASSES).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer, factor=0.5, patience=7, min_lr=1e-5)
     # GradScaler: Mixed Precision 학습 시 수치 안정성 보장
     scaler    = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
-    early_stopping = EarlyStopping(patience=15)
+    early_stopping = EarlyStopping(patience=args.patience)
 
     print(f"\n[MODEL] 파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
 
     # ── 학습 루프 ─────────────────────────────────────────────────────────
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
 
-    for epoch in range(1, 151):
+    for epoch in range(1, args.max_epochs + 1):
         train_loss, train_acc = run_epoch(
             model, train_loader, criterion, optimizer, scaler, DEVICE, is_train=True)
         val_loss, val_acc = run_epoch(
@@ -450,7 +676,7 @@ if __name__ == '__main__':
         history['val_acc'].append(val_acc)
 
         lr  = optimizer.param_groups[0]['lr']
-        tag = '✓' if improved else ' '
+        tag = '*' if improved else ' '
         print(f"[{tag}] Epoch {epoch:3d} | "
               f"Train {train_loss:.4f} / {train_acc*100:.1f}% | "
               f"Val {val_loss:.4f} / {val_acc*100:.1f}% | "
@@ -470,7 +696,8 @@ if __name__ == '__main__':
 
     # ── 결과 저장 ─────────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs('results', exist_ok=True)
+    results_dir = os.path.join('results', 'runs', timestamp)
+    os.makedirs(results_dir, exist_ok=True)
 
     # 클래스 이름 (idx → 키 문자)
     inv_map     = {v: k for k, v in RIGHT_HAND_KEYS.items()}
@@ -481,6 +708,14 @@ if __name__ == '__main__':
     cm = confusion_matrix(y_true, y_pred)
 
     dataset_info = {
+        'Dataset directory       ': args.dataset_dir,
+        'Preprocessing           ': 'notch' if args.notch_filter and args.filter_mode == 'raw' else args.filter_mode,
+        'Peak alignment          ': 'on' if args.align_peak else 'off',
+        'Peak search before/after': f'{args.peak_search_before}/{args.peak_search_after}',
+        'Model                   ': args.model,
+        'Seed                    ': args.seed,
+        'Max epochs              ': args.max_epochs,
+        'Patience                ': args.patience,
         'Train 샘플 수 (증강 후)': len(X_train),
         'Val 샘플 수             ': len(X_val),
         'Test 샘플 수            ': len(X_test),
@@ -488,17 +723,17 @@ if __name__ == '__main__':
 
     # ① 학습 곡선
     plot_history(history,
-                 save_path=f'results/training_history_{timestamp}.png')
+                 save_path=os.path.join(results_dir, 'training_history.png'))
     # ② 에포크 로그 CSV
     save_epoch_log(history,
-                   save_path=f'results/training_log_{timestamp}.csv')
+                   save_path=os.path.join(results_dir, 'training_log.csv'))
     # ③ 혼동 행렬
     plot_confusion_matrix(cm, class_names,
-                          save_path=f'results/confusion_matrix_{timestamp}.png')
+                          save_path=os.path.join(results_dir, 'confusion_matrix.png'))
     # ④ 텍스트 요약 리포트
     save_text_report(class_names, y_true, y_pred,
                      test_loss, test_acc, history,
                      dataset_info,
-                     save_path=f'results/report_{timestamp}.txt')
+                     save_path=os.path.join(results_dir, 'report.txt'))
 
-    print("\n[SUCCESS] 학습 완료 — 'best_emg_model.pt' 및 results/ 저장됨")
+    print(f"\n[SUCCESS] 학습 완료 - 'best_emg_model.pt' 및 {results_dir}/ 저장됨")
