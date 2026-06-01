@@ -27,9 +27,9 @@ BATCH_SIZE   = 64
 
 EPOCHS       = 150
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY  = 1e-3
+WEIGHT_DECAY  = 1e-4
 
-T_0          = 35
+T_0          = EPOCHS
 T_MULT       = 2
 ETA_MIN      = 1e-5
 PATIENCE     = 45
