@@ -107,13 +107,9 @@ class EMGDataset(Dataset):
             
             # 2. 시간 축 무작위 롤링
             if torch.rand(1).item() > 0.5:
-                shift = torch.randint(-8, 8, (1,)).item() # 범위 확장
+                shift = torch.randint(-3, 3, (1,)).item() # 범위 확장
                 x = torch.roll(x, shifts=shift, dims=0)
                 
-            # 3. 크기 변조(Scaling) 추가
-            if torch.rand(1).item() > 0.5:
-                scale_factor = torch.empty(1).uniform_(0.8, 1.2).item()
-                x = x * scale_factor
         return x, self.y[idx]
     
 # ==============================================================================
@@ -148,49 +144,46 @@ class ResBlock1D(nn.Module):
 class CNNLSTM(nn.Module):
     def __init__(self, num_channels, num_classes):
         super().__init__()
-        # 입력 채널 확장을 위한 초기 투영 레이어
         self.init_conv = nn.Sequential(
             nn.Conv1d(num_channels, 128, kernel_size=5, padding=2),
             nn.BatchNorm1d(128),
             nn.ReLU()
         )
-        # 잔차 연결 블록 탑재
         self.res_block1 = ResBlock1D(128)
-        self.pool1 = nn.MaxPool1d(2)
+        self.pool1 = nn.MaxPool1d(2) # 시퀀스 길이: 150 -> 75
         
         self.mid_conv = nn.Sequential(
             nn.Conv1d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm1d(256),
             nn.ReLU()
         )
-        self.res_block2 = ResBlock1D(256)
-        self.pool2 = nn.MaxPool1d(2)
+        self.res_block2 = ResBlock1D(256) # 맥스풀링 제거하여 길이 75 유지
 
-        # 양방향 LSTM 구성
+        # Bi-LSTM 구성 (입력: 256, 출력: 128 * 2 = 256)
         self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True, bidirectional=True)
         self.attention = Attention(hidden_size=256)
         self.dropout_lstm = nn.Dropout(0.4)
         
         self.classifier = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(256, 128), # 입력 차원을 Bi-LSTM 출력 크기인 256으로 고정
             nn.ReLU(),
             nn.Dropout(0.5), 
             nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)     
+        # x: [Batch, Window_Size(150), Channels]
+        x = x.permute(0, 2, 1) # [Batch, Channels, 150]
         x = self.init_conv(x)
         x = self.res_block1(x)
-        x = self.pool1(x)
+        x = self.pool1(x) # [Batch, 128, 75]
         
         x = self.mid_conv(x)
-        x = self.res_block2(x)
-        x = self.pool2(x)
+        x = self.res_block2(x) # [Batch, 256, 75]
         
-        x = x.permute(0, 2, 1)     
-        x, _ = self.lstm(x)         
-        x = self.attention(x)       
+        x = x.permute(0, 2, 1) # [Batch, 75, 256] (LSTM 입력 규격인 batch_first=True 만족)
+        x, _ = self.lstm(x) # [Batch, 75, 256]
+        x = self.attention(x) # [Batch, 256]
         x = self.dropout_lstm(x)
         return self.classifier(x)
     
@@ -340,12 +333,12 @@ if __name__ == '__main__':
     class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
     class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
     
-    # 메인 실행부 선언 코드 대체
-    criterion = FocalLoss(alpha=class_weights_tensor, gamma=2.0, reduction='mean', label_smoothing=0.1)
+    # 레이블 스무딩 계수를 0.1에서 0.02로 하향 조정하여 기본 수렴력 확보
+    criterion = FocalLoss(alpha=class_weights_tensor, gamma=2.0, reduction='mean', label_smoothing=0.02)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_MULT, eta_min=ETA_MIN)
     
-    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
+    scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
     early_stopping = EarlyStopping(patience=PATIENCE)
 
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
