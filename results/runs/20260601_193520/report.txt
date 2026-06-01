@@ -1,0 +1,53 @@
+============================================================
+   EMG 키보드 분류 모델 학습 결과 리포트
+============================================================
+
+[하이퍼파라미터]
+  WINDOW_SIZE  : 100 samples (~286ms @ 350Hz)
+  PRE_EVENT    : 40 / POST_EVENT : 60
+  BATCH_SIZE   : 64
+  NUM_CLASSES  : 19
+  NUM_CHANNELS : 8
+  Optimizer    : Adam (lr=1e-3)
+  Scheduler    : ReduceLROnPlateau (factor=0.5, patience=7)
+  EarlyStopping: patience=15
+  Augmentation : noise+shift+scale x3 (총 4배)
+
+[데이터셋]
+  Train 샘플 수 (증강 후): 26432
+  Val 샘플 수             : 1416
+  Test 샘플 수            : 1417
+
+[학습 결과]
+  총 에포크      : 50
+  Best Val Loss  : 0.8600
+  Best Val Acc   : 70.76%
+  Test Loss      : 0.8952
+  Test Accuracy  : 71.91%
+
+[클래스별 성능 (Test Set)]
+              precision    recall  f1-score   support
+
+           y       0.83      0.85      0.84        74
+           u       0.74      0.68      0.71        75
+           i       0.77      0.81      0.79        74
+           o       0.86      0.81      0.83        74
+           p       0.56      0.60      0.58        75
+           [       0.56      0.41      0.47        74
+           ]       0.75      0.69      0.72        74
+           \       0.82      0.88      0.85        75
+           h       0.67      0.65      0.66        75
+           j       0.59      0.59      0.59        75
+           k       0.60      0.61      0.61        75
+           l       0.75      0.65      0.70        75
+           ;       0.70      0.76      0.73        75
+           '       0.67      0.81      0.74        74
+           n       0.70      0.49      0.58        75
+           m       0.69      0.83      0.75        75
+           ,       0.79      0.88      0.83        75
+           .       0.80      0.92      0.86        75
+           /       0.79      0.74      0.77        73
+
+    accuracy                           0.72      1417
+   macro avg       0.72      0.72      0.72      1417
+weighted avg       0.72      0.72      0.72      1417

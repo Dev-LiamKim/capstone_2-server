@@ -1,0 +1,56 @@
+============================================================
+   EMG 키보드 분류 모델 학습 결과 리포트
+============================================================
+
+[하이퍼파라미터]
+  WINDOW_SIZE  : 100 samples (~286ms @ 350Hz)
+  PRE_EVENT    : 40 / POST_EVENT : 60
+  BATCH_SIZE   : 64
+  NUM_CLASSES  : 19
+  NUM_CHANNELS : 8
+  Optimizer    : Adam (lr=1e-3)
+  Scheduler    : ReduceLROnPlateau (factor=0.5, patience=7)
+  EarlyStopping: patience=15
+  Augmentation : noise+shift+scale x3 (총 4배)
+
+[데이터셋]
+  Dataset directory       : new_dataset
+  Preprocessing           : 60Hz notch filter
+  Seed                    : 42
+  Train 샘플 수 (증강 후): 26432
+  Val 샘플 수             : 1416
+  Test 샘플 수            : 1417
+
+[학습 결과]
+  총 에포크      : 34
+  Best Val Loss  : 0.8758
+  Best Val Acc   : 71.47%
+  Test Loss      : 0.8469
+  Test Accuracy  : 71.42%
+
+[클래스별 성능 (Test Set)]
+              precision    recall  f1-score   support
+
+           y       0.84      0.84      0.84        74
+           u       0.76      0.73      0.75        75
+           i       0.77      0.82      0.80        74
+           o       0.87      0.82      0.85        74
+           p       0.55      0.56      0.55        75
+           [       0.46      0.49      0.47        74
+           ]       0.68      0.73      0.70        74
+           \       0.82      0.87      0.84        75
+           h       0.74      0.75      0.74        75
+           j       0.64      0.60      0.62        75
+           k       0.59      0.44      0.50        75
+           l       0.75      0.65      0.70        75
+           ;       0.66      0.77      0.71        75
+           '       0.71      0.62      0.66        74
+           n       0.80      0.52      0.63        75
+           m       0.62      0.80      0.70        75
+           ,       0.72      0.88      0.79        75
+           .       0.81      0.92      0.86        75
+           /       0.83      0.74      0.78        73
+
+    accuracy                           0.71      1417
+   macro avg       0.72      0.71      0.71      1417
+weighted avg       0.72      0.71      0.71      1417
