@@ -1,125 +1,233 @@
 import time
-import torch
+import collections
 import numpy as np
-from scipy import signal
+import torch
+import torch.nn as nn
 from network import EMGReceiver
-from config import SERVER_PORT, CHANNELS, BATCH_SIZE, RIGHT_HAND_KEYS
-from train1 import CNNLSTM # 학습 코드가 작성된 파일에서 모델 아키텍처 직접 임포트
+from config import SERVER_PORT, CHANNELS, RIGHT_HAND_KEYS
 
-class RealtimeEMGClassifier:
-    def __init__(self, model_path='best_emg_model.pt', k_factor=3.5, ma_window=50, cooldown_time=0.2, fs=400.0):
+# ==============================================================================
+# 1. 하이브리드 모델 아키텍처 (독립형 구조)
+# ==============================================================================
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = nn.Linear(hidden_size, 1)
+
+    def forward(self, lstm_output):
+        attn_weights = torch.softmax(self.attn(lstm_output), dim=1) 
+        context = torch.sum(lstm_output * attn_weights, dim=1)     
+        return context
+
+class ResBlock1D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels)
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(x + self.block(x))
+
+class HandcraftedFeatures(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x**2, dim=-1) + 1e-8)
+        mav = torch.mean(torch.abs(x), dim=-1)
+        wl = torch.sum(torch.abs(x[:, :, 1:] - x[:, :, :-1]), dim=-1)
+        signs = torch.sign(x)
+        zc = torch.sum(torch.abs(signs[:, :, 1:] - signs[:, :, :-1]) == 2, dim=-1).float()
+        return torch.cat([rms, mav, wl, zc], dim=-1)
+
+class HybridCNNLSTM(nn.Module):
+    def __init__(self, num_channels, num_classes):
+        super().__init__()
+        self.init_conv = nn.Sequential(
+            nn.Conv1d(num_channels, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU()
+        )
+        self.res_block1 = ResBlock1D(128)
+        self.pool1 = nn.MaxPool1d(2) 
+        
+        self.mid_conv = nn.Sequential(
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU()
+        )
+        self.res_block2 = ResBlock1D(256) 
+
+        self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True, bidirectional=True)
+        self.attention = Attention(hidden_size=256)
+        self.dropout_lstm = nn.Dropout(0.4)
+        
+        self.hc_extractor = HandcraftedFeatures()
+        hc_dim = num_channels * 4
+        combined_dim = 256 + hc_dim
+        
+        self.feature_bn = nn.BatchNorm1d(combined_dim)
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(combined_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5), 
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):
+        x_permuted = x.permute(0, 2, 1)
+        hc_feats = self.hc_extractor(x_permuted)
+        
+        dl_x = self.init_conv(x_permuted)
+        dl_x = self.res_block1(dl_x)
+        dl_x = self.pool1(dl_x) 
+        
+        dl_x = self.mid_conv(dl_x)
+        dl_x = self.res_block2(dl_x) 
+        
+        dl_x = dl_x.permute(0, 2, 1) 
+        dl_x, _ = self.lstm(dl_x) 
+        dl_feats = self.attention(dl_x)
+        dl_feats = self.dropout_lstm(dl_feats)
+        
+        combined_feats = torch.cat([dl_feats, hc_feats], dim=-1)
+        combined_feats = self.feature_bn(combined_feats)
+        return self.classifier(combined_feats)
+
+
+# ==============================================================================
+# 2. 실시간 추론 엔진 클래스 (시뮬레이터 연동용 인라인 정규화 적용)
+# ==============================================================================
+WINDOW_SIZE = 150
+PRE_EVENT = 90
+BUFFER_SIZE = 500
+PEAK_WAIT_FRAMES = 100
+VOTING_SHIFTS = [-5, 0, 5]
+
+class RealtimeInferenceEngine:
+    def __init__(self, model_path='best_emg_model.pt'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 1. 학습 환경 기반 자판 레이블 사전 구축 (train1.py 스키마 완전 동기화)
         self.raw_labels = sorted(list(set(RIGHT_HAND_KEYS.values())))
         self.idx_to_label = {idx: raw_id for idx, raw_id in enumerate(self.raw_labels)}
         self.inv_key_map = {v: k for k, v in RIGHT_HAND_KEYS.items()}
         self.num_classes = len(self.raw_labels)
         
-        # 2. 파이토치 모델 로드 및 평가 모드 전환
-        self.model = CNNLSTM(num_channels=CHANNELS, num_classes=self.num_classes).to(self.device)
+        self.model = HybridCNNLSTM(num_channels=CHANNELS, num_classes=self.num_classes).to(self.device)
         self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
         self.model.eval()
         
-        # 3. 비대칭 윈도우 파라미터 셋팅 (PRE_EVENT: 90, POST_EVENT: 60)
-        self.window_size = 150
-        self.pre_event = 90
-        self.post_event = 60
-        self.raw_data_buffer = np.zeros((CHANNELS, 300)) # 충분한 크기의 링 버퍼 생성
-        self.post_peak_counter = -1
+        self.buffer = collections.deque(maxlen=BUFFER_SIZE)
+        self.state = 'IDLE'
+        self.wait_counter = 0
+        self.baseline_energy = 0.0
+        self.alpha = 0.01
         
-        # 4. 피크 감지용 하이퍼파라미터 및 실시간 인과적 필터 세팅
-        self.k_factor = k_factor
-        self.cooldown_samples = int(cooldown_time * fs)
-        self.current_cooldown = 0
-        self.history_buffer = np.zeros((CHANNELS, ma_window))
-        
-        nyquist = 0.5 * fs
-        high_cut = 20.0 / nyquist
-        self.b, self.a = signal.butter(4, high_cut, btype='high')
-        zi_1d = signal.lfilter_zi(self.b, self.a)
-        self.filter_state = np.zeros((CHANNELS, len(zi_1d)))
+        # [추가] 수신 체크용 총 샘플(프레임) 카운터
+        self.total_samples = 0
 
-    def process_samples(self, current_batch):
-        """배치 데이터를 받아 샘플 단위 인과적 필터링 및 비대칭 윈도우 기반 분류 수행"""
-        filtered_batch, self.filter_state = signal.lfilter(
-            self.b, self.a, current_batch, axis=1, zi=self.filter_state
-        )
-        rectified_batch = np.abs(filtered_batch)
-        spatial_avg_stream = np.mean(rectified_batch, axis=0)
+    def compute_tkeo(self, signal_2d):
+        tkeo = np.zeros_like(signal_2d)
+        tkeo[1:-1] = signal_2d[1:-1]**2 - signal_2d[:-2] * signal_2d[2:]
+        tkeo = np.clip(tkeo, 0, None)
+        return np.mean(tkeo, axis=1)
+
+    def process_stream(self, new_data_chunk):
+        # 1. 데이터를 루프 없이 한 번에 버퍼에 연장 (O(1) 처리)
+        self.buffer.extend(new_data_chunk)
+        self.total_samples += len(new_data_chunk)
         
-        for i in range(len(spatial_avg_stream)):
-            # 원시 데이터 타임라인 동기화 업데이트
-            self.raw_data_buffer = np.roll(self.raw_data_buffer, -1, axis=1)
-            self.raw_data_buffer[:, -1] = current_batch[:, i]
+        if self.total_samples % 175 < len(new_data_chunk):
+            print(f"[수신 상태 확인] 현재 {self.total_samples}프레임 수신 중...")
+
+        if len(self.buffer) < BUFFER_SIZE: return
+
+        # 2. 배치 단위 1회 연산으로 CPU 과부하 방지
+        current_raw_data = np.array(self.buffer)
+        energy_profile = self.compute_tkeo(current_raw_data)
+        current_energy = energy_profile[-1]
+
+        if self.state == 'IDLE':
+            self.baseline_energy = (1 - self.alpha) * self.baseline_energy + self.alpha * current_energy
             
-            # 피크 트리거 발생 후 후속 60샘플 수집 타이머 체크
-            if self.post_peak_counter > 0:
-                self.post_peak_counter -= 1
-                if self.post_peak_counter == 0:
-                    # 전방 90샘플 + 피크 시점 + 후방 59샘플 총 150샘플 슬라이싱
-                    target_window = self.raw_data_buffer[:, -self.window_size:] 
-                    self.execute_inference(target_window)
-                    self.post_peak_counter = -1
-            
-            # 쿨다운 제한 처리
-            if self.current_cooldown > 0:
-                self.current_cooldown -= 1
-                self.update_history_buffer(rectified_batch[:, i])
-                continue
+            # 절대 상수를 제거하고 순수 비율(4.0배)로만 검증
+            if current_energy > (self.baseline_energy * 4.0): 
+                self.state = 'WAIT_PEAK'
+                self.wait_counter = 0
                 
-            # 동적 베이스라인 기반 피크 검출
-            current_baseline = np.mean(self.history_buffer)
-            current_energy = spatial_avg_stream[i]
-            
-            if current_baseline > 0 and current_energy > (current_baseline * self.k_factor):
-                self.current_cooldown = self.cooldown_samples
-                self.post_peak_counter = self.post_event  # 후방 60샘플 수집 카운트다운 시작
-                print("\n[TRIGGER] 피크 감지 완료 -> 후속 데이터 60샘플 수집 대기 중...")
+        elif self.state == 'WAIT_PEAK':
+            self.wait_counter += len(new_data_chunk)
+            if self.wait_counter >= PEAK_WAIT_FRAMES:
+                self.extract_and_infer(current_raw_data, energy_profile)
+                self.state = 'COOLDOWN'
+                self.wait_counter = 0
                 
-            self.update_history_buffer(rectified_batch[:, i])
+        elif self.state == 'COOLDOWN':
+            self.wait_counter += len(new_data_chunk)
+            if self.wait_counter >= 100: 
+                self.state = 'IDLE'
 
-    def update_history_buffer(self, sample):
-        self.history_buffer = np.roll(self.history_buffer, -1, axis=1)
-        self.history_buffer[:, -1] = sample
-
-    def execute_inference(self, window_data):
-        """(8, 150) 원시 윈도우 데이터를 전처리 및 전치하여 딥러닝 모델 추론 진행"""
-        # 1. 차원 전치: (8, 150) -> (150, 8) [Time, Channels] 매핑
-        window_transposed = window_data.T
+    def extract_and_infer(self, current_raw_data, energy_profile):
+        search_start = BUFFER_SIZE - PEAK_WAIT_FRAMES - 30
+        peak_idx = search_start + np.argmax(energy_profile[search_start:BUFFER_SIZE])
+        base_start = peak_idx - PRE_EVENT
         
-        # 2. 실시간 Z-score 표준화 수행 (각 채널별 시간축 기준 스케일링)
-        win_mean = window_transposed.mean(axis=0, keepdims=True)
-        win_std = window_transposed.std(axis=0, keepdims=True) + 1e-8
-        normalized_window = (window_transposed - win_mean) / win_std
+        ensemble_probs = []
         
-        # 3. 파이토치 입력 포맷 변환 및 배치 차원 할당 -> (1, 150, 8)
-        model_input = torch.tensor(normalized_window, dtype=torch.float32).unsqueeze(0).to(self.device)
-        
-        # 4. 모델 순방향 추론 (Gradient 연산 제외)
         with torch.no_grad():
-            outputs = self.model(model_input)
-            pred_idx = outputs.argmax(1).item()
-            
-        # 5. 2단계 역매핑을 통한 아스키 문자 자판 변환
-        event_id = self.idx_to_label.get(pred_idx, None)
-        target_key = self.inv_key_map.get(event_id, "Unknown")
-        
-        print(f"▶ [인프런스 완료] 입력된 키보드 자판: '{target_key}' (이벤트 클래스 코드: {event_id})")
+            for shift in VOTING_SHIFTS:
+                start_idx = base_start + shift
+                end_idx = start_idx + WINDOW_SIZE
+                if start_idx < 0 or end_idx > BUFFER_SIZE: continue
+                
+                # [핵심] 슬라이싱된 150프레임 추론 윈도우 내부에서만 독립적 Z-score 정규화 수행
+                window = current_raw_data[start_idx:end_idx]
+                w_mean = np.mean(window, axis=(0, 1), keepdims=True)
+                w_std = np.std(window, axis=(0, 1), keepdims=True) + 1e-8
+                normalized_window = (window - w_mean) / w_std
+                
+                tensor_input = torch.tensor(normalized_window, dtype=torch.float32).unsqueeze(0).to(self.device)
+                probs = torch.softmax(self.model(tensor_input), dim=1).cpu().numpy()[0]
+                ensemble_probs.append(probs)
 
+        if ensemble_probs:
+            avg_probs = np.mean(ensemble_probs, axis=0)
+            pred_idx = np.argmax(avg_probs)
+            confidence = avg_probs[pred_idx]
+            
+            if confidence > 0.5: # 판정 신뢰도 기준선
+                event_id = self.idx_to_label.get(pred_idx, None)
+                target_key = self.inv_key_map.get(event_id, "Unknown")
+                print(f"▶ [실시간 감지 성공] 예측 키: '{target_key}' | 신뢰도: {confidence*100:.1f}%")
+
+# ==============================================================================
+# 3. 메인 실행 루프
+# ==============================================================================
 def main_run():
     receiver = EMGReceiver(SERVER_PORT)
     receiver.wait_for_connection()
     
-    classifier_system = RealtimeEMGClassifier()
-    print("EMG 실시간 비대칭 윈도우 인공지능 분류 루프 시작")
+    engine = RealtimeInferenceEngine()
+    print("EMG 실시간 피크 동기화 추론 엔진 가동 (하이브리드 독립형)")
+    print("※ 베이스라인 캘리브레이션을 위해 최초 1~2초간 손을 움직이지 마십시오.")
     
-    while True:
-        batch = receiver.receive_batch()
-        if batch is not None:
-            classifier_system.process_samples(batch)
-        else:
-            time.sleep(0.001)
+    try:
+        while True:
+            data_chunk = receiver.receive_batch() 
+            if data_chunk is not None and len(data_chunk) > 0:
+                engine.process_stream(data_chunk)
+            else:
+                time.sleep(0.001)
+    except KeyboardInterrupt:
+        print("\n추론 엔진 종료")
 
 if __name__ == "__main__":
     main_run()
