@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from datetime import datetime
 from sklearn.model_selection import train_test_split
@@ -16,22 +17,22 @@ from sklearn.utils.class_weight import compute_class_weight
 from config import RIGHT_HAND_KEYS, CHANNELS
 
 # ==============================================================================
-# 1. 하이퍼파라미터 세팅 (78.12% 재현 버전)
+# 1. 하이퍼파라미터 세팅 (학습 주기 연장 반영)
 # ==============================================================================
-WINDOW_SIZE  = 150
-PRE_EVENT    = 90
+WINDOW_SIZE  = 210
+PRE_EVENT    = 140
 POST_EVENT   = WINDOW_SIZE - PRE_EVENT
 NUM_CHANNELS = CHANNELS
 BATCH_SIZE   = 64
 
-EPOCHS       = 150
+EPOCHS       = 200
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY  = 1e-4
+WEIGHT_DECAY  = 1e-3
 
-T_0          = 15
+T_0          = 50
 T_MULT       = 2
 ETA_MIN      = 1e-5
-PATIENCE     = 15
+PATIENCE     = 60
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -41,7 +42,7 @@ idx_to_label = {idx: raw_id for idx, raw_id in enumerate(raw_labels)}
 NUM_CLASSES  = len(raw_labels)
 
 # ==============================================================================
-# 2. 데이터 전처리 (데이터 증강 없음, 순수 분할)
+# 2. 데이터 전처리 및 증강 (보수적 데이터 증강 적용)
 # ==============================================================================
 def extract_windows_from_df(df):
     ch_cols = [f"CH{i}" for i in range(NUM_CHANNELS)]
@@ -91,29 +92,31 @@ def preprocess(dataset_dir='new_dataset'):
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 class EMGDataset(Dataset):
-    def __init__(self, X, y, augment=False): # augment 인자 추가
+    def __init__(self, X, y, augment=False):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
-        self.augment = augment # 속성 저장
+        self.augment = augment
         
     def __len__(self): return len(self.X)
     
     def __getitem__(self, idx):
-        x = self.X[idx]
+        x = self.X[idx].clone()
+        
         if self.augment:
-            # 1. 가우시안 노이즈 주입
+            # 원본 패턴 보존을 위해 노이즈, 스케일링, 시프트 기본 증강만 유지 (Mixup, Time Warping 제외)
             if torch.rand(1).item() > 0.5:
-                x = x + torch.randn_like(x) * 0.01
-            
-            # 2. 시간 축 무작위 롤링
+                x = x + torch.randn_like(x) * 0.05
             if torch.rand(1).item() > 0.5:
-                shift = torch.randint(-3, 3, (1,)).item() # 범위 확장
+                scale = torch.empty(1).uniform_(0.8, 1.2).item()
+                x = x * scale
+            if torch.rand(1).item() > 0.5:
+                shift = torch.randint(-3, 3, (1,)).item()
                 x = torch.roll(x, shifts=shift, dims=0)
-                
+
         return x, self.y[idx]
-    
+
 # ==============================================================================
-# 3. 모델 아키텍처 (오리지널 CNN-LSTM 복원)
+# 3. 모델 아키텍처 (하이브리드 아키텍처 재통합 및 정규화 레이어 최적화)
 # ==============================================================================
 class Attention(nn.Module):
     def __init__(self, hidden_size):
@@ -132,7 +135,7 @@ class ResBlock1D(nn.Module):
             nn.Conv1d(channels, channels, kernel_size=3, padding=1),
             nn.BatchNorm1d(channels),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout1d(0.4), # Spatial Dropout 유지
             nn.Conv1d(channels, channels, kernel_size=3, padding=1),
             nn.BatchNorm1d(channels)
         )
@@ -141,59 +144,82 @@ class ResBlock1D(nn.Module):
     def forward(self, x):
         return self.relu(x + self.block(x))
 
-class CNNLSTM(nn.Module):
+class HandcraftedFeatures(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x**2, dim=-1) + 1e-8)
+        mav = torch.mean(torch.abs(x), dim=-1)
+        wl = torch.sum(torch.abs(x[:, :, 1:] - x[:, :, :-1]), dim=-1)
+        signs = torch.sign(x)
+        zc = torch.sum(torch.abs(signs[:, :, 1:] - signs[:, :, :-1]) == 2, dim=-1).float()
+        return torch.cat([rms, mav, wl, zc], dim=-1)
+
+class HybridCNNLSTM(nn.Module):
     def __init__(self, num_channels, num_classes):
         super().__init__()
+        
         self.init_conv = nn.Sequential(
             nn.Conv1d(num_channels, 128, kernel_size=5, padding=2),
             nn.BatchNorm1d(128),
             nn.ReLU()
         )
         self.res_block1 = ResBlock1D(128)
-        self.pool1 = nn.MaxPool1d(2) # 시퀀스 길이: 150 -> 75
+        self.pool1 = nn.MaxPool1d(2) 
         
         self.mid_conv = nn.Sequential(
             nn.Conv1d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm1d(256),
             nn.ReLU()
         )
-        self.res_block2 = ResBlock1D(256) # 맥스풀링 제거하여 길이 75 유지
+        self.res_block2 = ResBlock1D(256) 
 
-        # Bi-LSTM 구성 (입력: 256, 출력: 128 * 2 = 256)
         self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True, bidirectional=True)
         self.attention = Attention(hidden_size=256)
         self.dropout_lstm = nn.Dropout(0.4)
         
+        self.hc_extractor = HandcraftedFeatures()
+        hc_dim = num_channels * 4
+        combined_dim = 256 + hc_dim
+        
+        # 스케일 불균형 방지를 위해 LayerNorm 대신 BatchNorm1d 원복
+        self.feature_bn = nn.BatchNorm1d(combined_dim)
+        
         self.classifier = nn.Sequential(
-            nn.Linear(256, 128), # 입력 차원을 Bi-LSTM 출력 크기인 256으로 고정
+            nn.Linear(combined_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.5), 
             nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
-        # x: [Batch, Window_Size(150), Channels]
-        x = x.permute(0, 2, 1) # [Batch, Channels, 150]
-        x = self.init_conv(x)
-        x = self.res_block1(x)
-        x = self.pool1(x) # [Batch, 128, 75]
+        x_permuted = x.permute(0, 2, 1)
         
-        x = self.mid_conv(x)
-        x = self.res_block2(x) # [Batch, 256, 75]
+        hc_feats = self.hc_extractor(x_permuted)
         
-        x = x.permute(0, 2, 1) # [Batch, 75, 256] (LSTM 입력 규격인 batch_first=True 만족)
-        x, _ = self.lstm(x) # [Batch, 75, 256]
-        x = self.attention(x) # [Batch, 256]
-        x = self.dropout_lstm(x)
-        return self.classifier(x)
-    
+        dl_x = self.init_conv(x_permuted)
+        dl_x = self.res_block1(dl_x)
+        dl_x = self.pool1(dl_x) 
+        
+        dl_x = self.mid_conv(dl_x)
+        dl_x = self.res_block2(dl_x) 
+        
+        dl_x = dl_x.permute(0, 2, 1) 
+        dl_x, _ = self.lstm(dl_x) 
+        dl_feats = self.attention(dl_x)
+        dl_feats = self.dropout_lstm(dl_feats)
+        
+        combined_feats = torch.cat([dl_feats, hc_feats], dim=-1)
+        combined_feats = self.feature_bn(combined_feats) # BatchNorm1d 적용
+        
+        return self.classifier(combined_feats)
+
 # ==============================================================================
 # 4. Focal Loss 및 훈련 유틸리티
 # ==============================================================================
-# FocalLoss 구현부 내부 또는 선언부 수정
-# nn.CrossEntropyLoss에 label_smoothing 파라미터 연동 구조 매핑 필요시 아래 형태로 대입
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.1):
+    def __init__(self, alpha=None, gamma=3.0, reduction='mean', label_smoothing=0.02):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -201,7 +227,6 @@ class FocalLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, inputs, targets):
-        # label_smoothing 옵션 추가
         ce_loss = nn.CrossEntropyLoss(weight=self.alpha, reduction='none', label_smoothing=self.label_smoothing)(inputs, targets)
         pt = torch.exp(-ce_loss)
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
@@ -209,8 +234,6 @@ class FocalLoss(nn.Module):
         if self.reduction == 'mean': return focal_loss.mean()
         elif self.reduction == 'sum': return focal_loss.sum()
         return focal_loss
-
-
 
 class EarlyStopping:
     def __init__(self, patience=PATIENCE, path='best_emg_model.pt'):
@@ -257,7 +280,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, is_train):
     return total_loss / total, correct / total
 
 # ==============================================================================
-# 6. 리포트 생성 및 시각화 유틸리티
+# 5. 리포트 생성 및 시각화 유틸리티
 # ==============================================================================
 def get_predictions(model, loader, device):
     model.eval()
@@ -303,11 +326,11 @@ def save_text_report(class_names, y_true, y_pred, test_loss, test_acc, history, 
     report = classification_report(y_true, y_pred, target_names=class_names)
     lines = [
         "============================================================",
-        "   EMG 키보드 분류 모델 학습 결과 리포트 (78.12% 재현 버전)",
+        "   EMG 키보드 분류 하이브리드 모델 학습 결과 리포트",
         "============================================================",
         f"  총 에포크      : {len(history['train_loss'])}",
         f"  Best Val Loss  : {min(history['val_loss']):.4f}",
-        f"  Best Val Acc   : {max(history['val_acc']):.2f}%",
+        f"  Best Val Acc   : {max(history['val_acc'])*100:.2f}%",
         f"  Test Loss      : {test_loss:.4f}",
         f"  Test Accuracy  : {test_acc*100:.2f}%\n",
         "[클래스별 성능 (Test Set)]\n",
@@ -317,24 +340,22 @@ def save_text_report(class_names, y_true, y_pred, test_loss, test_acc, history, 
         f.write("\n".join(lines))
 
 # ==============================================================================
-# 5. 메인 실행 루프
+# 6. 메인 실행 루프
 # ==============================================================================
 if __name__ == '__main__':
     X_train, X_val, X_test, y_train, y_val, y_test = preprocess('new_dataset')
     
     pin = (DEVICE.type == 'cuda')
-    # train_loader 선언부 수정 (augment=True 설정)
     train_loader = DataLoader(EMGDataset(X_train, y_train, augment=True), batch_size=BATCH_SIZE, shuffle=True, pin_memory=pin)
     val_loader   = DataLoader(EMGDataset(X_val, y_val, augment=False), batch_size=BATCH_SIZE, shuffle=False, pin_memory=pin)
     test_loader  = DataLoader(EMGDataset(X_test, y_test, augment=False), batch_size=BATCH_SIZE, shuffle=False, pin_memory=pin)
 
-    model = CNNLSTM(NUM_CHANNELS, NUM_CLASSES).to(DEVICE)
+    model = HybridCNNLSTM(NUM_CHANNELS, NUM_CLASSES).to(DEVICE)
     
     class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
     class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
     
-    # 레이블 스무딩 계수를 0.1에서 0.02로 하향 조정하여 기본 수렴력 확보
-    criterion = FocalLoss(alpha=class_weights_tensor, gamma=2.0, reduction='mean', label_smoothing=0.02)
+    criterion = FocalLoss(alpha=class_weights_tensor, gamma=3.0, reduction='mean', label_smoothing=0.02)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_MULT, eta_min=ETA_MIN)
     
@@ -365,31 +386,25 @@ if __name__ == '__main__':
             break
         
     # ==============================================================================
-    # 7. 테스트 셋 평가 및 결과물 파일 추출 (메인 실행 루프 최하단 추가)
+    # 7. 테스트 셋 평가 및 파일 추출
     # ==============================================================================
-    # 1) 최고 성능 가중치 로딩 및 평가
     model.load_state_dict(torch.load('best_emg_model.pt', map_location=DEVICE, weights_only=True))
     test_loss, test_acc = run_epoch(model, test_loader, criterion, None, scaler, DEVICE, is_train=False)
     print(f"\n[RESULT] Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc*100:.2f}%")
 
-    # 2) 저장소 및 타임스탬프 설정
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs('results', exist_ok=True)
 
-    # 3) 테스트 예측 수행 및 행렬 계산
     y_true, y_pred = get_predictions(model, test_loader, DEVICE)
     cm = confusion_matrix(y_true, y_pred)
     
-    # 4) 클래스 이름 매핑 (숫자 라벨 -> 알파벳/기호)
     inv_map = {v: k for k, v in RIGHT_HAND_KEYS.items()}
     class_names = [inv_map[idx_to_label[i]] for i in range(NUM_CLASSES)]
 
-    # 5) 시각화 이미지 및 리포트 저장 수행
     plot_history(history, save_path=f'results/training_history_{timestamp}.png')
     plot_confusion_matrix(cm, class_names, save_path=f'results/confusion_matrix_{timestamp}.png')
     save_text_report(class_names, y_true, y_pred, test_loss, test_acc, history, save_path=f'results/report_{timestamp}.txt')
 
-    # 6) 에포크 로그 CSV 덤프
     pd.DataFrame({
         'epoch': range(1, len(history['train_loss']) + 1),
         'train_loss': history['train_loss'],
@@ -397,7 +412,3 @@ if __name__ == '__main__':
         'train_acc': history['train_acc'],
         'val_acc': history['val_acc']
     }).to_csv(f'results/training_log_{timestamp}.csv', index=False)
-
-    print(f"\n[SUCCESS] 모든 분석 리포트 및 로그 저장 완료 (results/ 폴더)")
-            
-    # 테스트 셋 평가 코드 생략 (필요 시 test_loader 및 get_predictions 구문 추가)
