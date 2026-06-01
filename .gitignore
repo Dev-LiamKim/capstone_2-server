@@ -1,5 +1,28 @@
- 
-venv/ 
-__pycache__/ 
-*.pyc 
-*.pt 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+
+# Local generated artifacts
+*.npy
+*.pt
+*.keras
+*.h5
+*.db
+*.sqlite
+*.sqlite3
+*.docx
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

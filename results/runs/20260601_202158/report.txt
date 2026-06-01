@@ -1,0 +1,58 @@
+============================================================
+   EMG 키보드 분류 모델 학습 결과 리포트
+============================================================
+
+[하이퍼파라미터]
+  WINDOW_SIZE  : 100 samples (~286ms @ 350Hz)
+  PRE_EVENT    : 20 / POST_EVENT : 80
+  BATCH_SIZE   : 64
+  NUM_CLASSES  : 19
+  NUM_CHANNELS : 8
+  Optimizer    : Adam (lr=1e-3)
+  Scheduler    : ReduceLROnPlateau (factor=0.5, patience=7)
+  EarlyStopping: patience=15
+  Augmentation : noise+shift+scale x3 (총 4배)
+
+[데이터셋]
+  Dataset directory       : new_dataset
+  Preprocessing           : raw
+  Seed                    : 42
+  Max epochs              : 80
+  Patience                : 8
+  Train 샘플 수 (증강 후): 26432
+  Val 샘플 수             : 1416
+  Test 샘플 수            : 1417
+
+[학습 결과]
+  총 에포크      : 29
+  Best Val Loss  : 0.7808
+  Best Val Acc   : 72.81%
+  Test Loss      : 0.8060
+  Test Accuracy  : 72.12%
+
+[클래스별 성능 (Test Set)]
+              precision    recall  f1-score   support
+
+           y       0.78      0.89      0.83        74
+           u       0.73      0.73      0.73        75
+           i       0.77      0.80      0.78        74
+           o       0.93      0.85      0.89        74
+           p       0.68      0.67      0.68        75
+           [       0.53      0.38      0.44        74
+           ]       0.54      0.70      0.61        74
+           \       0.82      0.81      0.82        75
+           h       0.76      0.59      0.66        75
+           j       0.75      0.63      0.68        75
+           k       0.62      0.53      0.57        75
+           l       0.81      0.75      0.78        75
+           ;       0.78      0.71      0.74        75
+           '       0.57      0.70      0.63        74
+           n       0.68      0.67      0.67        75
+           m       0.65      0.81      0.72        75
+           ,       0.76      0.81      0.79        75
+           .       0.85      0.97      0.91        75
+           /       0.76      0.70      0.73        73
+
+    accuracy                           0.72      1417
+   macro avg       0.72      0.72      0.72      1417
+weighted avg       0.72      0.72      0.72      1417

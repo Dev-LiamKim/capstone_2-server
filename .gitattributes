@@ -1,0 +1,8 @@
+*.csv -diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.keras binary
+*.pt binary
+*.npy binary
+*.docx binary
