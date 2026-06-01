@@ -39,7 +39,8 @@ class EMGRealTimeInference:
                 self.data_buffer[:, -BATCH_SIZE:] = batch
                 
                 # 60Hz 전원 잡음 제거 필터링
-                processed = np.array([signal.lfilter(self.b, self.a, ch - np.mean(ch)) for ch in self.data_buffer])
+                # processed = np.array([signal.lfilter(self.b, self.a, ch - np.mean(ch)) for ch in self.data_buffer])
+                processed = np.array([ch - np.mean(ch) for ch in self.data_buffer])
                 
                 # 쿨다운 타임 관리
                 if self.cooldown > 0:

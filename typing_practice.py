@@ -103,9 +103,9 @@ class TypingWindow(QtWidgets.QWidget):
             return
 
         if self.app and not self.app.is_recording and self.current_cycle == 1 and self.keys_in_cycle == 0:
-            os.makedirs("dataset", exist_ok=True)
+            os.makedirs("new_dataset", exist_ok=True)
             current_timestamp = time.strftime("%Y%m%d_%H%M%S")
-            generated_filename = f"dataset/recording_{current_timestamp}.csv"
+            generated_filename = f"new_dataset/recording_{current_timestamp}.csv"
             
             # 파일 생성 없이 기록 플래그 활성화 및 파일명만 전달
             self.app.start_full_recording(generated_filename)
