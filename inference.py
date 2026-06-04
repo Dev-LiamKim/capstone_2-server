@@ -9,6 +9,26 @@ from scipy import signal
 from config import (
     BATCH_SIZE,
     CHANNELS,
+    INFERENCE_AUTO_THRESHOLD,
+    INFERENCE_BUFFER_SIZE,
+    INFERENCE_CALIBRATION_SECONDS,
+    INFERENCE_COOLDOWN_SAMPLES,
+    INFERENCE_DEVICE,
+    INFERENCE_FILTER_MODE,
+    INFERENCE_GUI,
+    INFERENCE_GUI_INTERVAL_MS,
+    INFERENCE_MIN_CONFIDENCE,
+    INFERENCE_MIN_MARGIN,
+    INFERENCE_MIN_VOTES,
+    INFERENCE_MODEL_PATH,
+    INFERENCE_MODEL_TYPE,
+    INFERENCE_PRINT_RMS,
+    INFERENCE_RMS_LOG_INTERVAL,
+    INFERENCE_THRESHOLD,
+    INFERENCE_THRESHOLD_MULTIPLIER,
+    INFERENCE_TOP_K,
+    INFERENCE_VOTE_WINDOW,
+    INFERENCE_WINDOW_SIZE,
     NOTCH_F0,
     NOTCH_Q,
     RIGHT_HAND_KEYS,
@@ -507,33 +527,34 @@ def run_gui(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run real-time EMG keyboard inference.")
-    parser.add_argument("--model-path", default="best_emg_model.pt")
-    parser.add_argument("--model", choices=["cnn_lstm", "resnet1d"], default="cnn_lstm")
+    parser.add_argument("--model-path", default=INFERENCE_MODEL_PATH)
+    parser.add_argument("--model", choices=["cnn_lstm", "resnet1d"], default=INFERENCE_MODEL_TYPE)
     parser.add_argument("--port", type=int, default=SERVER_PORT)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=INFERENCE_DEVICE)
     parser.add_argument("--sample-rate", type=float, default=SAMPLING_RATE_THEORETICAL)
     parser.add_argument(
         "--filter-mode",
         choices=["raw", "notch", "highpass_20", "highpass_20_notch"],
-        default="highpass_20",
+        default=INFERENCE_FILTER_MODE,
     )
-    parser.add_argument("--window-size", type=int, default=200)
-    parser.add_argument("--buffer-size", type=int, default=2000)
-    parser.add_argument("--threshold", type=float, default=80000.0)
-    parser.add_argument("--auto-threshold", action="store_true", default=True)
+    parser.add_argument("--window-size", type=int, default=INFERENCE_WINDOW_SIZE)
+    parser.add_argument("--buffer-size", type=int, default=INFERENCE_BUFFER_SIZE)
+    parser.add_argument("--threshold", type=float, default=INFERENCE_THRESHOLD)
+    parser.add_argument("--auto-threshold", action="store_true", default=INFERENCE_AUTO_THRESHOLD)
     parser.add_argument("--manual-threshold", action="store_false", dest="auto_threshold")
-    parser.add_argument("--calibration-seconds", type=float, default=3.0)
-    parser.add_argument("--threshold-multiplier", type=float, default=4.0)
-    parser.add_argument("--min-confidence", type=float, default=0.35)
-    parser.add_argument("--min-margin", type=float, default=0.10)
-    parser.add_argument("--vote-window", type=int, default=3)
-    parser.add_argument("--min-votes", type=int, default=2)
-    parser.add_argument("--cooldown-samples", type=int, default=200)
-    parser.add_argument("--top-k", type=int, default=3)
-    parser.add_argument("--print-rms", action="store_true")
-    parser.add_argument("--rms-log-interval", type=float, default=1.0)
-    parser.add_argument("--gui", action="store_true")
-    parser.add_argument("--gui-interval-ms", type=int, default=10)
+    parser.add_argument("--calibration-seconds", type=float, default=INFERENCE_CALIBRATION_SECONDS)
+    parser.add_argument("--threshold-multiplier", type=float, default=INFERENCE_THRESHOLD_MULTIPLIER)
+    parser.add_argument("--min-confidence", type=float, default=INFERENCE_MIN_CONFIDENCE)
+    parser.add_argument("--min-margin", type=float, default=INFERENCE_MIN_MARGIN)
+    parser.add_argument("--vote-window", type=int, default=INFERENCE_VOTE_WINDOW)
+    parser.add_argument("--min-votes", type=int, default=INFERENCE_MIN_VOTES)
+    parser.add_argument("--cooldown-samples", type=int, default=INFERENCE_COOLDOWN_SAMPLES)
+    parser.add_argument("--top-k", type=int, default=INFERENCE_TOP_K)
+    parser.add_argument("--print-rms", action="store_true", default=INFERENCE_PRINT_RMS)
+    parser.add_argument("--rms-log-interval", type=float, default=INFERENCE_RMS_LOG_INTERVAL)
+    parser.add_argument("--gui", action="store_true", default=INFERENCE_GUI)
+    parser.add_argument("--no-gui", action="store_false", dest="gui")
+    parser.add_argument("--gui-interval-ms", type=int, default=INFERENCE_GUI_INTERVAL_MS)
     return parser.parse_args()
 
 
