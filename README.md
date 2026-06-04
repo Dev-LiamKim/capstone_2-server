@@ -101,6 +101,34 @@ Training writes:
 - `results/runs/<timestamp>/training_history.png`
 - `results/runs/<timestamp>/confusion_matrix.png`
 
+## Real-Time Inference
+
+Run real-time inference with the trained PyTorch model:
+
+```powershell
+.\venv\Scripts\python.exe inference.py --model-path best_emg_model.pt --window-size 200 --filter-mode highpass_20
+```
+
+The script waits for the ESP32 TCP client on `SERVER_PORT` from `config.py`, keeps a rolling signal buffer, applies the selected streaming filter, and prints predicted keys when recent EMG RMS crosses the trigger threshold.
+
+Useful options:
+
+```text
+--threshold          RMS trigger threshold, default 80000
+--min-confidence     Minimum softmax confidence to print a prediction, default 0.35
+--cooldown-samples   Samples to wait after a prediction, default 200
+--print-rms          Print recent RMS once per interval for threshold calibration
+--device             auto, cpu, or cuda
+```
+
+Threshold calibration example:
+
+```powershell
+.\venv\Scripts\python.exe inference.py --print-rms --threshold 999999999
+```
+
+Watch the idle RMS and typing RMS, then rerun with a threshold between those two ranges.
+
 ## Current Best Result
 
 See the local report:
@@ -120,4 +148,4 @@ Summary:
 
 ## Notes
 
-`inference.py` currently loads a TensorFlow/Keras model (`best_emg_model.keras`), while `train.py` now trains a PyTorch model (`best_emg_model.pt`). For deployment, the inference path should be updated to use the PyTorch model or a model conversion step should be added.
+`inference.py` uses the PyTorch model (`best_emg_model.pt`) trained by `train.py`.
