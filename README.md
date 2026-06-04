@@ -109,22 +109,35 @@ Run real-time inference with the trained PyTorch model:
 .\venv\Scripts\python.exe inference.py --model-path best_emg_model.pt --window-size 200 --filter-mode highpass_20
 ```
 
-The script waits for the ESP32 TCP client on `SERVER_PORT` from `config.py`, keeps a rolling signal buffer, applies the selected streaming filter, and prints predicted keys when recent EMG RMS crosses the trigger threshold.
+Run with the status GUI:
+
+```powershell
+.\venv\Scripts\python.exe inference.py --gui --model-path best_emg_model.pt --window-size 200 --filter-mode highpass_20
+```
+
+The script waits for the ESP32 TCP client on `SERVER_PORT` from `config.py`, keeps a rolling signal buffer, applies the selected streaming filter, calibrates the RMS trigger threshold, stabilizes repeated predictions with a short vote window, and prints or displays predicted keys.
 
 Useful options:
 
 ```text
---threshold          RMS trigger threshold, default 80000
---min-confidence     Minimum softmax confidence to print a prediction, default 0.35
---cooldown-samples   Samples to wait after a prediction, default 200
---print-rms          Print recent RMS once per interval for threshold calibration
---device             auto, cpu, or cuda
+--gui                 Show a PyQt status window
+--threshold           Manual RMS fallback threshold, default 80000
+--manual-threshold    Disable automatic threshold calibration
+--calibration-seconds Idle calibration duration, default 3.0
+--threshold-multiplier threshold = idle_mean + multiplier * idle_std
+--min-confidence      Minimum softmax confidence, default 0.35
+--min-margin          Minimum top-1 minus top-2 confidence margin, default 0.10
+--vote-window         Number of recent candidates to vote over, default 3
+--min-votes           Required votes for one emitted prediction, default 2
+--cooldown-samples    Samples to wait after a prediction, default 200
+--print-rms           Print recent RMS once per interval
+--device              auto, cpu, or cuda
 ```
 
 Threshold calibration example:
 
 ```powershell
-.\venv\Scripts\python.exe inference.py --print-rms --threshold 999999999
+.\venv\Scripts\python.exe inference.py --print-rms --manual-threshold --threshold 999999999
 ```
 
 Watch the idle RMS and typing RMS, then rerun with a threshold between those two ranges.
