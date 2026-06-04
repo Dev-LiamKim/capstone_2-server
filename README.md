@@ -134,6 +134,25 @@ Useful options:
 --device              auto, cpu, or cuda
 ```
 
+The same defaults can be edited in `config.py` under the real-time inference section. CLI options override `config.py` for one-off tests.
+
+Common `config.py` values for testers:
+
+```python
+INFERENCE_GUI = True
+INFERENCE_FILTER_MODE = "highpass_20"
+INFERENCE_WINDOW_SIZE = 200
+INFERENCE_AUTO_THRESHOLD = True
+INFERENCE_THRESHOLD = 80000.0
+INFERENCE_CALIBRATION_SECONDS = 3.0
+INFERENCE_THRESHOLD_MULTIPLIER = 4.0
+INFERENCE_MIN_CONFIDENCE = 0.35
+INFERENCE_MIN_MARGIN = 0.10
+INFERENCE_VOTE_WINDOW = 3
+INFERENCE_MIN_VOTES = 2
+INFERENCE_COOLDOWN_SAMPLES = 200
+```
+
 Threshold calibration example:
 
 ```powershell

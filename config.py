@@ -14,6 +14,34 @@ HZ_CHECK_INTERVAL = 0.5          # 샘플링 레이트 계산 주기 (초)
 HZ_HISTORY_DURATION = 5.0       # 이동 평균 계산 윈도우 크기 (초)
 HZ_THRESHOLD_LOW = 345.0         # 입력 차단 기준 임계 속도 (Hz)
 
+# 실시간 추론 기본 설정
+INFERENCE_MODEL_PATH = "best_emg_model.pt"
+INFERENCE_MODEL_TYPE = "cnn_lstm"            # "cnn_lstm" 또는 "resnet1d"
+INFERENCE_DEVICE = "auto"                    # "auto", "cpu", "cuda"
+INFERENCE_FILTER_MODE = "highpass_20"        # "raw", "notch", "highpass_20", "highpass_20_notch"
+INFERENCE_WINDOW_SIZE = 200
+INFERENCE_BUFFER_SIZE = 2000
+
+# 자동 threshold 보정: 연결 직후 안정 상태 RMS 기준으로 threshold 산출
+INFERENCE_AUTO_THRESHOLD = True
+INFERENCE_THRESHOLD = 80000.0                # 수동 threshold 또는 자동 보정 전 초기값
+INFERENCE_CALIBRATION_SECONDS = 3.0
+INFERENCE_THRESHOLD_MULTIPLIER = 4.0
+
+# 예측 안정화 설정
+INFERENCE_MIN_CONFIDENCE = 0.35
+INFERENCE_MIN_MARGIN = 0.10                  # top-1 confidence - top-2 confidence
+INFERENCE_VOTE_WINDOW = 3
+INFERENCE_MIN_VOTES = 2
+INFERENCE_COOLDOWN_SAMPLES = 200
+INFERENCE_TOP_K = 3
+
+# 로그 및 GUI 설정
+INFERENCE_PRINT_RMS = False
+INFERENCE_RMS_LOG_INTERVAL = 1.0
+INFERENCE_GUI = False
+INFERENCE_GUI_INTERVAL_MS = 10
+
 # 오른손 입력 가능 키 매핑
 RIGHT_HAND_KEYS = {
     'y': 11, 'u': 12, 'i': 13, 'o': 14, 'p': 15, '[': 16, ']': 17, '\\': 18,
