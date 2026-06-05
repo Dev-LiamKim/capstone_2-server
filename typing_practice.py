@@ -1,159 +1,414 @@
-import random 
 import os
-import time
-from pyqtgraph.Qt import QtWidgets, QtCore, QtGui 
-from config import RIGHT_HAND_KEYS
+import glob
+import itertools
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 
-class TypingWindow(QtWidgets.QWidget):
-    def __init__(self, app_reference=None):
+from config import RIGHT_HAND_KEYS, CHANNELS
+
+# ==============================================================================
+# 1. 하이퍼파라미터 세팅 (학습 주기 연장 반영)
+# ==============================================================================
+WINDOW_SIZE  = 210
+PRE_EVENT    = 140
+POST_EVENT   = WINDOW_SIZE - PRE_EVENT
+NUM_CHANNELS = CHANNELS
+BATCH_SIZE   = 64
+
+EPOCHS       = 200
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY  = 1e-3
+
+T_0          = 50
+T_MULT       = 2
+ETA_MIN      = 1e-5
+PATIENCE     = 60
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+raw_labels   = sorted(list(set(RIGHT_HAND_KEYS.values())))
+label_to_idx = {raw_id: idx for idx, raw_id in enumerate(raw_labels)}
+idx_to_label = {idx: raw_id for idx, raw_id in enumerate(raw_labels)}
+NUM_CLASSES  = len(raw_labels)
+
+# ==============================================================================
+# 2. 데이터 전처리 및 증강 (보수적 데이터 증강 적용)
+# ==============================================================================
+def extract_windows_from_df(df):
+    ch_cols = [f"CH{i}" for i in range(NUM_CHANNELS)]
+    signal  = df[ch_cols].values
+    events  = df[df['Event'] != 0]
+
+    X_list, y_list = [], []
+    for row_idx, row in events.iterrows():
+        start = row_idx - PRE_EVENT
+        end   = row_idx + POST_EVENT
+        if start < 0 or end > len(signal):
+            continue
+        label = int(row['Event'])
+        if label not in label_to_idx:
+            continue
+        X_list.append(signal[start:end])
+        y_list.append(label_to_idx[label])
+
+    return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.int32)
+
+def load_dataset(dataset_dir='new_dataset'):
+    csv_files = glob.glob(os.path.join(dataset_dir, '*.csv'))
+    X_all, y_all = [], []
+    for path in csv_files:
+        df = pd.read_csv(path)
+        X, y = extract_windows_from_df(df)
+        if len(X) == 0: continue
+        
+        sess_mean = X.mean(axis=(0, 1), keepdims=True)
+        sess_std  = X.std(axis=(0, 1),  keepdims=True) + 1e-8
+        X = (X - sess_mean) / sess_std
+
+        X_all.append(X)
+        y_all.append(y)
+
+    return np.concatenate(X_all, axis=0), np.concatenate(y_all, axis=0)
+
+def preprocess(dataset_dir='new_dataset'):
+    X_all, y_all = load_dataset(dataset_dir)
+    
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X_all, y_all, test_size=0.30, random_state=42, stratify=y_all
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp
+    )
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+class EMGDataset(Dataset):
+    def __init__(self, X, y, augment=False):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+        self.augment = augment
+        
+    def __len__(self): return len(self.X)
+    
+    def __getitem__(self, idx):
+        x = self.X[idx].clone()
+        
+        if self.augment:
+            # 원본 패턴 보존을 위해 노이즈, 스케일링, 시프트 기본 증강만 유지 (Mixup, Time Warping 제외)
+            if torch.rand(1).item() > 0.5:
+                x = x + torch.randn_like(x) * 0.05
+            if torch.rand(1).item() > 0.5:
+                scale = torch.empty(1).uniform_(0.8, 1.2).item()
+                x = x * scale
+            if torch.rand(1).item() > 0.5:
+                shift = torch.randint(-3, 3, (1,)).item()
+                x = torch.roll(x, shifts=shift, dims=0)
+
+        return x, self.y[idx]
+
+# ==============================================================================
+# 3. 모델 아키텍처 (하이브리드 아키텍처 재통합 및 정규화 레이어 최적화)
+# ==============================================================================
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
         super().__init__()
-        self.app = app_reference  
-        self.setWindowTitle("EMG Key Position Practice")
-        self.resize(550, 250)
-        self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint)
+        self.attn = nn.Linear(hidden_size, 1)
 
-        self.char_pool = [k for k in RIGHT_HAND_KEYS.keys() if len(k) == 1]
-        self.pool_size = len(self.char_pool)
-        self.practice_queue = []
+    def forward(self, lstm_output):
+        attn_weights = torch.softmax(self.attn(lstm_output), dim=1) 
+        context = torch.sum(lstm_output * attn_weights, dim=1)     
+        return context
+
+class ResBlock1D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(),
+            nn.Dropout1d(0.4), # Spatial Dropout 유지
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels)
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(x + self.block(x))
+
+class HandcraftedFeatures(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x**2, dim=-1) + 1e-8)
+        mav = torch.mean(torch.abs(x), dim=-1)
+        wl = torch.sum(torch.abs(x[:, :, 1:] - x[:, :, :-1]), dim=-1)
+        signs = torch.sign(x)
+        zc = torch.sum(torch.abs(signs[:, :, 1:] - signs[:, :, :-1]) == 2, dim=-1).float()
+        return torch.cat([rms, mav, wl, zc], dim=-1)
+
+class HybridCNNLSTM(nn.Module):
+    def __init__(self, num_channels, num_classes):
+        super().__init__()
         
-        self.current_cycle = 1
-        self.max_cycles = 50
-        self.keys_in_cycle = 0
+        self.init_conv = nn.Sequential(
+            nn.Conv1d(num_channels, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU()
+        )
+        self.res_block1 = ResBlock1D(128)
+        self.pool1 = nn.MaxPool1d(2) 
         
-        layout = QtWidgets.QVBoxLayout()
+        self.mid_conv = nn.Sequential(
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU()
+        )
+        self.res_block2 = ResBlock1D(256) 
+
+        self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True, bidirectional=True)
+        self.attention = Attention(hidden_size=256)
+        self.dropout_lstm = nn.Dropout(0.4)
         
-        self.lbl_instr = QtWidgets.QLabel(f"제시된 글자를 누르세요 (진행도: {self.current_cycle}/{self.max_cycles} 사이클 | {self.keys_in_cycle}/{self.pool_size})")
-        self.lbl_instr.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.hc_extractor = HandcraftedFeatures()
+        hc_dim = num_channels * 4
+        combined_dim = 256 + hc_dim
         
-        target_layout = QtWidgets.QHBoxLayout()
-        target_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        target_layout.setSpacing(25)
+        # 스케일 불균형 방지를 위해 LayerNorm 대신 BatchNorm1d 원복
+        self.feature_bn = nn.BatchNorm1d(combined_dim)
         
-        self.lbl_current = QtWidgets.QLabel("")
-        self.lbl_current.setFont(QtGui.QFont("Arial", 38, QtGui.QFont.Weight.Bold))
-        self.lbl_current.setStyleSheet("color: #0055ff;")
+        self.classifier = nn.Sequential(
+            nn.Linear(combined_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5), 
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):
+        x_permuted = x.permute(0, 2, 1)
         
-        self.lbl_next = QtWidgets.QLabel("")
-        self.lbl_next.setFont(QtGui.QFont("Arial", 26, QtGui.QFont.Weight.Normal))
-        self.lbl_next.setStyleSheet("color: #888888;")
+        hc_feats = self.hc_extractor(x_permuted)
         
-        self.lbl_next_next = QtWidgets.QLabel("")
-        self.lbl_next_next.setFont(QtGui.QFont("Arial", 18, QtGui.QFont.Weight.Normal))
-        self.lbl_next_next.setStyleSheet("color: #d3d3d3;")
+        dl_x = self.init_conv(x_permuted)
+        dl_x = self.res_block1(dl_x)
+        dl_x = self.pool1(dl_x) 
         
-        target_layout.addWidget(self.lbl_current)
-        target_layout.addWidget(self.lbl_next)
-        target_layout.addWidget(self.lbl_next_next)
+        dl_x = self.mid_conv(dl_x)
+        dl_x = self.res_block2(dl_x) 
         
-        self.entry = QtWidgets.QLineEdit()
-        self.entry.setFont(QtGui.QFont("Arial", 18))
-        self.entry.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.entry.textChanged.connect(self.check_result)
-
-        self.lbl_status = QtWidgets.QLabel("대기 중...")
-        self.lbl_status.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-
-        layout.addWidget(self.lbl_instr)
-        layout.addLayout(target_layout)
-        layout.addWidget(self.entry)
-        layout.addWidget(self.lbl_status)
-        self.setLayout(layout)
-
-        self.update_display()
-
-    def fill_queue_if_needed(self):
-        while len(self.practice_queue) < 3:
-            new_batch = list(self.char_pool)
-            random.shuffle(new_batch)
-            self.practice_queue.extend(new_batch)
-
-    def update_display(self):
-        if self.current_cycle > self.max_cycles:
-            self.lbl_current.setText("종료")
-            self.lbl_next.setText("")
-            self.lbl_next_next.setText("")
-            return
-
-        self.fill_queue_if_needed()
+        dl_x = dl_x.permute(0, 2, 1) 
+        dl_x, _ = self.lstm(dl_x) 
+        dl_feats = self.attention(dl_x)
+        dl_feats = self.dropout_lstm(dl_feats)
         
-        self.target_text = self.practice_queue.pop(0)
-        self.lbl_current.setText(self.target_text)
+        combined_feats = torch.cat([dl_feats, hc_feats], dim=-1)
+        combined_feats = self.feature_bn(combined_feats) # BatchNorm1d 적용
         
-        remaining_total = ((self.max_cycles - self.current_cycle) * self.pool_size) + (self.pool_size - self.keys_in_cycle)
+        return self.classifier(combined_feats)
+
+# ==============================================================================
+# 4. Focal Loss 및 훈련 유틸리티
+# ==============================================================================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=3.0, reduction='mean', label_smoothing=0.02):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        ce_loss = nn.CrossEntropyLoss(weight=self.alpha, reduction='none', label_smoothing=self.label_smoothing)(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
         
-        if remaining_total >= 2:
-            self.lbl_next.setText(self.practice_queue[0])
-        else:
-            self.lbl_next.setText("")
-            
-        if remaining_total >= 3:
-            self.lbl_next_next.setText(self.practice_queue[1])
-        else:
-            self.lbl_next_next.setText("")
+        if self.reduction == 'mean': return focal_loss.mean()
+        elif self.reduction == 'sum': return focal_loss.sum()
+        return focal_loss
 
-    def check_result(self, text):
-        if not text:
-            return
+class EarlyStopping:
+    def __init__(self, patience=PATIENCE, path='best_emg_model.pt'):
+        self.patience = patience
+        self.path = path
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.early_stop = False
 
-        if self.current_cycle > self.max_cycles:
-            self.entry.blockSignals(True)
-            self.entry.clear()
-            self.entry.setDisabled(True)
-            self.entry.blockSignals(False)
-            return
+    def __call__(self, val_loss, model):
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.counter = 0
+            torch.save(model.state_dict(), self.path)
+            return True
+        self.counter += 1
+        if self.counter >= self.patience: self.early_stop = True
+        return False
 
-        if self.app and not self.app.is_recording and self.current_cycle == 1 and self.keys_in_cycle == 0:
-            os.makedirs("new_dataset", exist_ok=True)
-            current_timestamp = time.strftime("%Y%m%d_%H%M%S")
-            generated_filename = f"new_dataset/recording_{current_timestamp}.csv"
-            
-            # 파일 생성 없이 기록 플래그 활성화 및 파일명만 전달
-            self.app.start_full_recording(generated_filename)
+def run_epoch(model, loader, criterion, optimizer, scaler, device, is_train):
+    model.train() if is_train else model.eval()
+    total_loss, correct, total = 0.0, 0, 0
 
-        if text == self.target_text:
-            if self.app:
-                self.app.pending_event = RIGHT_HAND_KEYS.get(text, 0)
+    grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
+    with grad_ctx:
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
 
-            self.keys_in_cycle += 1
-            
-            if self.keys_in_cycle >= self.pool_size:
-                self.keys_in_cycle = 0
-                self.current_cycle += 1
-            
-            if self.current_cycle > self.max_cycles:
-                self.lbl_instr.setText("제시된 글자를 누르세요 (진행도: 완료)")
-                self.lbl_status.setText("50 사이클 연습 전체 완료! 데이터셋 저장 완료.")
-                self.lbl_status.setStyleSheet("color: blue; font-weight: bold;")
-                self.lbl_current.setText("종료")
-                self.lbl_next.setText("")
-                self.lbl_next_next.setText("")
-                self.entry.setDisabled(True)
-                
-                # 성공 종료 플래그(True) 전달
-                if self.app and self.app.is_recording:
-                    self.app.stop_full_recording(success=True)
-            else:
-                self.lbl_instr.setText(f"제시된 글자를 누르세요 (진행도: {self.current_cycle}/{self.max_cycles} 사이클 | {self.keys_in_cycle}/{self.pool_size})")
-                self.lbl_status.setText("정확함!")
-                self.lbl_status.setStyleSheet("color: green;")
-                self.update_display()
-            
-            self.entry.blockSignals(True)
-            self.entry.clear()
-            self.entry.blockSignals(False)
-        else:
-            if self.app:
-                self.app.pending_event = 0
+            with torch.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
 
-            self.lbl_status.setText(f"오타! '{self.target_text}'를 누르세요")
-            self.lbl_status.setStyleSheet("color: red;")
-            
-            self.entry.blockSignals(True)
-            self.entry.clear()
-            self.entry.blockSignals(False)
+            if is_train:
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-    # 창을 강제로 닫을 때 실패 처리 매핑
-    def closeEvent(self, event):
-        if self.app and self.app.is_recording:
-            self.app.stop_full_recording(success=False)
-        event.accept()
+            total_loss += loss.item() * len(y_batch)
+            correct += (outputs.argmax(1) == y_batch).sum().item()
+            total += len(y_batch)
+
+    return total_loss / total, correct / total
+
+# ==============================================================================
+# 5. 리포트 생성 및 시각화 유틸리티
+# ==============================================================================
+def get_predictions(model, loader, device):
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device, non_blocking=True)
+            outputs = model(X_batch)
+            y_pred.extend(outputs.argmax(1).cpu().numpy())
+            y_true.extend(y_batch.numpy())
+    return np.array(y_true), np.array(y_pred)
+
+def plot_history(history, save_path):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(history['train_acc'], label='Train Acc')
+    axes[0].plot(history['val_acc'], label='Val Acc')
+    axes[0].set_title('Accuracy')
+    axes[0].legend()
+    axes[1].plot(history['train_loss'], label='Train Loss')
+    axes[1].plot(history['val_loss'], label='Val Loss')
+    axes[1].set_title('Loss')
+    axes[1].legend()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+def plot_confusion_matrix(cm, class_names, save_path):
+    fig, ax = plt.subplots(figsize=(14, 12))
+    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+    plt.colorbar(im, ax=ax)
+    ax.set_xticks(range(len(class_names)))
+    ax.set_yticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=45)
+    ax.set_yticklabels(class_names)
+    thresh = cm.max() / 2.0
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        ax.text(j, i, str(cm[i, j]), ha='center', va='center',
+                color='white' if cm[i, j] > thresh else 'black')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+def save_text_report(class_names, y_true, y_pred, test_loss, test_acc, history, save_path):
+    report = classification_report(y_true, y_pred, target_names=class_names)
+    lines = [
+        "============================================================",
+        "   EMG 키보드 분류 하이브리드 모델 학습 결과 리포트",
+        "============================================================",
+        f"  총 에포크      : {len(history['train_loss'])}",
+        f"  Best Val Loss  : {min(history['val_loss']):.4f}",
+        f"  Best Val Acc   : {max(history['val_acc'])*100:.2f}%",
+        f"  Test Loss      : {test_loss:.4f}",
+        f"  Test Accuracy  : {test_acc*100:.2f}%\n",
+        "[클래스별 성능 (Test Set)]\n",
+        report
+    ]
+    with open(save_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+
+# ==============================================================================
+# 6. 메인 실행 루프
+# ==============================================================================
+if __name__ == '__main__':
+    X_train, X_val, X_test, y_train, y_val, y_test = preprocess('new_dataset')
+    
+    pin = (DEVICE.type == 'cuda')
+    train_loader = DataLoader(EMGDataset(X_train, y_train, augment=True), batch_size=BATCH_SIZE, shuffle=True, pin_memory=pin)
+    val_loader   = DataLoader(EMGDataset(X_val, y_val, augment=False), batch_size=BATCH_SIZE, shuffle=False, pin_memory=pin)
+    test_loader  = DataLoader(EMGDataset(X_test, y_test, augment=False), batch_size=BATCH_SIZE, shuffle=False, pin_memory=pin)
+
+    model = HybridCNNLSTM(NUM_CHANNELS, NUM_CLASSES).to(DEVICE)
+    
+    class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
+    
+    criterion = FocalLoss(alpha=class_weights_tensor, gamma=3.0, reduction='mean', label_smoothing=0.02)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_MULT, eta_min=ETA_MIN)
+    
+    scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
+    early_stopping = EarlyStopping(patience=PATIENCE)
+
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+
+    print("\n[학습 시작]==============================================")
+    for epoch in range(1, EPOCHS + 1):
+        train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, scaler, DEVICE, is_train=True)
+        val_loss, val_acc     = run_epoch(model, val_loader, criterion, optimizer, scaler, DEVICE, is_train=False)
+
+        scheduler.step()
+        improved = early_stopping(val_loss, model)
+
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+
+        lr = optimizer.param_groups[0]['lr']
+        tag = '✓' if improved else ' '
+        print(f"[{tag}] Epoch {epoch:3d} | Train Loss {train_loss:.4f} / Acc {train_acc*100:.1f}% | Val Loss {val_loss:.4f} / Acc {val_acc*100:.1f}% | LR {lr:.1e}")
+
+        if early_stopping.early_stop:
+            print(f"\n[EARLY STOP] {epoch} 에포크 조기 종료 (best val_loss: {early_stopping.best_loss:.4f})")
+            break
+        
+    # ==============================================================================
+    # 7. 테스트 셋 평가 및 파일 추출
+    # ==============================================================================
+    model.load_state_dict(torch.load('best_emg_model.pt', map_location=DEVICE, weights_only=True))
+    test_loss, test_acc = run_epoch(model, test_loader, criterion, None, scaler, DEVICE, is_train=False)
+    print(f"\n[RESULT] Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc*100:.2f}%")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs('results', exist_ok=True)
+
+    y_true, y_pred = get_predictions(model, test_loader, DEVICE)
+    cm = confusion_matrix(y_true, y_pred)
+    
+    inv_map = {v: k for k, v in RIGHT_HAND_KEYS.items()}
+    class_names = [inv_map[idx_to_label[i]] for i in range(NUM_CLASSES)]
+
+    plot_history(history, save_path=f'results/training_history_{timestamp}.png')
+    plot_confusion_matrix(cm, class_names, save_path=f'results/confusion_matrix_{timestamp}.png')
+    save_text_report(class_names, y_true, y_pred, test_loss, test_acc, history, save_path=f'results/report_{timestamp}.txt')
+
+    pd.DataFrame({
+        'epoch': range(1, len(history['train_loss']) + 1),
+        'train_loss': history['train_loss'],
+        'val_loss': history['val_loss'],
+        'train_acc': history['train_acc'],
+        'val_acc': history['val_acc']
+    }).to_csv(f'results/training_log_{timestamp}.csv', index=False)

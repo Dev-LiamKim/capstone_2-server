@@ -17,7 +17,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from config import RIGHT_HAND_KEYS, CHANNELS
 
 # ==============================================================================
-# 1. 하이퍼파라미터 세팅 (학습 주기 연장 반영)
+# 1. 하이퍼파라미터 세팅
 # ==============================================================================
 WINDOW_SIZE  = 210
 PRE_EVENT    = 140
@@ -27,12 +27,10 @@ BATCH_SIZE   = 64
 
 EPOCHS       = 200
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY  = 1e-3
+WEIGHT_DECAY  = 1e-2  # 가중치 감쇠 상향 (정규화 강화)
 
-T_0          = 50
-T_MULT       = 2
-ETA_MIN      = 1e-5
-PATIENCE     = 60
+PATIENCE     = 60     # Early Stopping 인내심
+LR_PATIENCE  = 15     # ReduceLROnPlateau 인내심
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -42,7 +40,7 @@ idx_to_label = {idx: raw_id for idx, raw_id in enumerate(raw_labels)}
 NUM_CLASSES  = len(raw_labels)
 
 # ==============================================================================
-# 2. 데이터 전처리 및 증강 (보수적 데이터 증강 적용)
+# 2. 데이터 전처리 및 증강 (데이터 증강 범위 확대)
 # ==============================================================================
 def extract_windows_from_df(df):
     ch_cols = [f"CH{i}" for i in range(NUM_CHANNELS)]
@@ -103,20 +101,20 @@ class EMGDataset(Dataset):
         x = self.X[idx].clone()
         
         if self.augment:
-            # 원본 패턴 보존을 위해 노이즈, 스케일링, 시프트 기본 증강만 유지 (Mixup, Time Warping 제외)
+            # 증강 강도 상향 적용
             if torch.rand(1).item() > 0.5:
-                x = x + torch.randn_like(x) * 0.05
+                x = x + torch.randn_like(x) * 0.1  
             if torch.rand(1).item() > 0.5:
-                scale = torch.empty(1).uniform_(0.8, 1.2).item()
+                scale = torch.empty(1).uniform_(0.7, 1.3).item()
                 x = x * scale
             if torch.rand(1).item() > 0.5:
-                shift = torch.randint(-3, 3, (1,)).item()
+                shift = torch.randint(-5, 5, (1,)).item()
                 x = torch.roll(x, shifts=shift, dims=0)
 
         return x, self.y[idx]
 
 # ==============================================================================
-# 3. 모델 아키텍처 (하이브리드 아키텍처 재통합 및 정규화 레이어 최적화)
+# 3. 모델 아키텍처 (드롭아웃 상향을 통한 과적합 방지)
 # ==============================================================================
 class Attention(nn.Module):
     def __init__(self, hidden_size):
@@ -135,7 +133,7 @@ class ResBlock1D(nn.Module):
             nn.Conv1d(channels, channels, kernel_size=3, padding=1),
             nn.BatchNorm1d(channels),
             nn.ReLU(),
-            nn.Dropout1d(0.4), # Spatial Dropout 유지
+            nn.Dropout1d(0.5), # Spatial Dropout 상향
             nn.Conv1d(channels, channels, kernel_size=3, padding=1),
             nn.BatchNorm1d(channels)
         )
@@ -177,19 +175,18 @@ class HybridCNNLSTM(nn.Module):
 
         self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True, bidirectional=True)
         self.attention = Attention(hidden_size=256)
-        self.dropout_lstm = nn.Dropout(0.4)
+        self.dropout_lstm = nn.Dropout(0.5) # LSTM Dropout 상향
         
         self.hc_extractor = HandcraftedFeatures()
         hc_dim = num_channels * 4
         combined_dim = 256 + hc_dim
         
-        # 스케일 불균형 방지를 위해 LayerNorm 대신 BatchNorm1d 원복
         self.feature_bn = nn.BatchNorm1d(combined_dim)
         
         self.classifier = nn.Sequential(
             nn.Linear(combined_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.5), 
+            nn.Dropout(0.6), # 분류기 Dropout 상향
             nn.Linear(128, num_classes),
         )
 
@@ -211,7 +208,7 @@ class HybridCNNLSTM(nn.Module):
         dl_feats = self.dropout_lstm(dl_feats)
         
         combined_feats = torch.cat([dl_feats, hc_feats], dim=-1)
-        combined_feats = self.feature_bn(combined_feats) # BatchNorm1d 적용
+        combined_feats = self.feature_bn(combined_feats)
         
         return self.classifier(combined_feats)
 
@@ -357,7 +354,9 @@ if __name__ == '__main__':
     
     criterion = FocalLoss(alpha=class_weights_tensor, gamma=3.0, reduction='mean', label_smoothing=0.02)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_MULT, eta_min=ETA_MIN)
+    
+    # 스케줄러 변경: 검증 손실 기반 ReduceLROnPlateau 적용
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=LR_PATIENCE, min_lr=1e-6)
     
     scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
     early_stopping = EarlyStopping(patience=PATIENCE)
@@ -369,7 +368,8 @@ if __name__ == '__main__':
         train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, scaler, DEVICE, is_train=True)
         val_loss, val_acc     = run_epoch(model, val_loader, criterion, optimizer, scaler, DEVICE, is_train=False)
 
-        scheduler.step()
+        # 스케줄러 스텝에 검증 손실 전달
+        scheduler.step(val_loss)
         improved = early_stopping(val_loss, model)
 
         history['train_loss'].append(train_loss)
