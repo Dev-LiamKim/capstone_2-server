@@ -1,0 +1,53 @@
+============================================================
+   EMG 키보드 분류 모델 학습 결과 리포트
+============================================================
+
+[하이퍼파라미터]
+  WINDOW_SIZE  : 100
+  PRE_EVENT    : 40 / POST_EVENT : 60
+  BATCH_SIZE   : 64
+  Optimizer    : Adam (lr=1e-3)
+  Scheduler    : CosineAnnealingWarmRestarts (T_0=10, T_mult=2)
+  Loss Function: Focal Loss (gamma=2.0)
+
+[데이터셋]
+  Dataset dir: dataset
+  Preprocessing: raw
+  Model: improved
+  Train Set: 31636
+  Val Set: 1695
+  Test Set: 1695
+
+[학습 결과]
+  총 에포크      : 30
+  Best Val Loss  : 0.6457
+  Best Val Acc   : 64.78%
+  Test Loss      : 0.6412
+  Test Accuracy  : 63.83%
+
+[클래스별 성능 (Test Set)]
+              precision    recall  f1-score   support
+
+           y       0.64      0.74      0.69        89
+           u       0.51      0.43      0.47        90
+           i       0.86      0.80      0.83        89
+           o       0.83      0.70      0.76        89
+           p       0.59      0.53      0.56        89
+           [       0.42      0.34      0.38        87
+           ]       0.57      0.65      0.61        89
+           \       0.73      0.80      0.76        90
+           h       0.62      0.70      0.66        90
+           j       0.53      0.57      0.55        90
+           k       0.51      0.59      0.55        90
+           l       0.70      0.64      0.67        89
+           ;       0.64      0.62      0.63        89
+           '       0.66      0.58      0.62        89
+           n       0.56      0.54      0.55        90
+           m       0.71      0.58      0.64        89
+           ,       0.61      0.69      0.65        89
+           .       0.75      0.89      0.81        89
+           /       0.71      0.73      0.72        89
+
+    accuracy                           0.64      1695
+   macro avg       0.64      0.64      0.64      1695
+weighted avg       0.64      0.64      0.64      1695
