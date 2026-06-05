@@ -20,6 +20,7 @@ from config import (
     INFERENCE_FILTER_MODE,
     INFERENCE_GUI,
     INFERENCE_GUI_INTERVAL_MS,
+    INFERENCE_GUI_KEY_HOLD_MS,
     INFERENCE_ACTIVE_CALIBRATION_SECONDS,
     INFERENCE_CALIBRATION_MODE,
     INFERENCE_CALIBRATION_ONLY,
@@ -36,6 +37,8 @@ from config import (
     INFERENCE_REPLAY_LOOP,
     INFERENCE_REPLAY_REALTIME,
     INFERENCE_REPLAY_SPEED,
+    INFERENCE_REPLAY_AUTO_THRESHOLD,
+    INFERENCE_REPLAY_THRESHOLD_PERCENTILE,
     INFERENCE_RMS_LOG_INTERVAL,
     INFERENCE_THRESHOLD,
     INFERENCE_THRESHOLD_MULTIPLIER,
@@ -71,6 +74,7 @@ class ReplayEMGReceiver:
         self.cursor = 0
         self.last_emit = None
         self.samples = self._load_samples(csv_path)
+        self.events = self._load_events(csv_path)
 
     def _load_samples(self, csv_path):
         data = np.loadtxt(
@@ -85,6 +89,19 @@ class ReplayEMGReceiver:
         if data.shape[1] != CHANNELS:
             raise ValueError(f"Replay CSV must contain CH0..CH{CHANNELS - 1} columns.")
         return data
+
+    def _load_events(self, csv_path):
+        try:
+            events = np.loadtxt(
+                csv_path,
+                delimiter=",",
+                skiprows=1,
+                usecols=CHANNELS,
+                dtype=np.float32,
+            )
+        except (IndexError, ValueError):
+            return None
+        return np.atleast_1d(events)
 
     def wait_for_connection(self):
         print(f"[REPLAY] loaded {len(self.samples)} samples from {self.csv_path}")
@@ -111,6 +128,10 @@ class ReplayEMGReceiver:
         batch = self.samples[self.cursor : self.cursor + BATCH_SIZE].T
         self.cursor += BATCH_SIZE
         return batch
+
+    def close(self):
+        """실시간 TCP 수신기와 동일한 종료 인터페이스를 맞추기 위한 no-op."""
+        return None
 
 
 class InferenceLogger:
@@ -383,6 +404,7 @@ class EMGRealTimeInference:
         self.connected_addr = None
         self.last_rms_log = time.time()
         self.prediction_count = 0
+        self.emitted_keys = deque(maxlen=20)
         self.done = False
         self.active_calibration_started_at = None
         self.active_calibration_seconds = max(0.001, args.active_calibration_seconds)
@@ -422,15 +444,18 @@ class EMGRealTimeInference:
         return model
 
     def run(self):
-        self.wait_for_connection()
-
         try:
+            self.wait_for_connection()
             while not self.done:
                 self.process_once()
+        except KeyboardInterrupt:
+            print("\n[STOP] Interrupted by user.")
         finally:
+            self.receiver.close()
             self.logger.close()
 
     def wait_for_connection(self):
+        self._prepare_replay_threshold()
         if self.args.auto_threshold:
             print(
                 "[CALIBRATION] Keep your hand relaxed for "
@@ -441,11 +466,116 @@ class EMGRealTimeInference:
         print(
             "[CONFIG] "
             f"window={self.args.window_size}, filter={self.args.filter_mode}, "
-            f"threshold={self.args.threshold}, cooldown={self.args.cooldown_samples}, "
+            f"threshold={self.threshold:.1f}, cooldown={self.args.cooldown_samples}, "
             f"votes={self.args.min_votes}/{self.args.vote_window}, "
             f"log={self.args.log}, calibration_mode={self.args.calibration_mode}"
         )
         return self.connected_addr
+
+    def _prepare_replay_threshold(self):
+        if not self.args.replay_csv or not self.args.replay_auto_threshold:
+            return
+
+        threshold, stats = self._estimate_replay_threshold()
+        if threshold is None:
+            print(
+                "[REPLAY THRESHOLD] failed to estimate from dataset; "
+                f"using fallback threshold={self.threshold:.1f}"
+            )
+            return
+
+        self.threshold = threshold
+        self.calibrator.threshold = threshold
+        self.calibrator.done = True
+        self.calibrator.stats = stats
+        self.args.auto_threshold = False
+
+        if stats["method"] == "event_label":
+            print(
+                "[REPLAY THRESHOLD] "
+                f"threshold={threshold:.1f}, balanced_acc={stats['balanced_acc']:.3f}, "
+                f"idle_batches={stats['idle_count']}, active_batches={stats['active_count']}"
+            )
+        else:
+            print(
+                "[REPLAY THRESHOLD] "
+                f"threshold={threshold:.1f} from p{self.args.replay_threshold_percentile:.1f} "
+                f"RMS percentile; event labels unavailable"
+            )
+
+    def _estimate_replay_threshold(self):
+        samples = getattr(self.receiver, "samples", None)
+        if samples is None or len(samples) < BATCH_SIZE:
+            return None, None
+
+        threshold_filter = StreamingFilter(self.args.filter_mode, self.args.sample_rate)
+        rms_values = []
+        active_flags = []
+        events = getattr(self.receiver, "events", None)
+
+        usable = (len(samples) // BATCH_SIZE) * BATCH_SIZE
+        for start in range(0, usable, BATCH_SIZE):
+            batch = samples[start : start + BATCH_SIZE].T
+            processed = threshold_filter.process(batch)
+            rms_values.append(self._recent_rms(processed))
+
+            if events is not None and len(events) >= start + BATCH_SIZE:
+                event_batch = events[start : start + BATCH_SIZE]
+                active_flags.append(bool(np.any(event_batch != 0)))
+
+        if not rms_values:
+            return None, None
+
+        rms = np.array(rms_values, dtype=np.float32)
+        stats = {
+            "mean": float(np.mean(rms)),
+            "std": float(np.std(rms)),
+            "min": float(np.min(rms)),
+            "max": float(np.max(rms)),
+        }
+
+        if active_flags and any(active_flags) and not all(active_flags):
+            threshold, score = self._find_best_binary_threshold(rms, np.array(active_flags, dtype=bool))
+            idle_count = int(np.sum(~np.array(active_flags, dtype=bool)))
+            active_count = int(np.sum(np.array(active_flags, dtype=bool)))
+            stats.update(
+                {
+                    "method": "event_label",
+                    "balanced_acc": score,
+                    "idle_count": idle_count,
+                    "active_count": active_count,
+                }
+            )
+            return threshold, stats
+
+        percentile = min(100.0, max(0.0, self.args.replay_threshold_percentile))
+        threshold = float(np.percentile(rms, percentile))
+        stats.update({"method": "percentile"})
+        return threshold, stats
+
+    def _find_best_binary_threshold(self, rms, active):
+        sorted_rms = np.unique(np.sort(rms))
+        if len(sorted_rms) == 1:
+            return float(sorted_rms[0]), 0.5
+
+        candidates = (sorted_rms[:-1] + sorted_rms[1:]) / 2.0
+        candidates = np.concatenate(([sorted_rms[0] - 1.0], candidates, [sorted_rms[-1] + 1.0]))
+
+        best_threshold = float(candidates[0])
+        best_score = -1.0
+        for threshold in candidates:
+            predicted_active = rms >= threshold
+            tp = np.sum(predicted_active & active)
+            tn = np.sum(~predicted_active & ~active)
+            fp = np.sum(predicted_active & ~active)
+            fn = np.sum(~predicted_active & active)
+            tpr = tp / (tp + fn) if (tp + fn) else 0.0
+            tnr = tn / (tn + fp) if (tn + fp) else 0.0
+            score = float((tpr + tnr) / 2.0)
+            if score > best_score:
+                best_score = score
+                best_threshold = float(threshold)
+        return best_threshold, best_score
 
     def process_once(self):
         # GUI timer와 CLI loop가 공통으로 호출하는 한 batch 처리 단위입니다.
@@ -520,6 +650,8 @@ class EMGRealTimeInference:
         state.setdefault("source", self.source_name)
         state.setdefault("threshold", self.threshold)
         state.setdefault("cooldown", self.cooldown)
+        state.setdefault("emitted_history", " ".join(self.emitted_keys))
+        state.setdefault("last_emitted_key", self.emitted_keys[-1] if self.emitted_keys else "")
         self.last_status = state
         self.logger.log(state)
         return state
@@ -684,6 +816,7 @@ class EMGRealTimeInference:
             f"top={candidate['top']}"
         )
         self.cooldown = self.args.cooldown_samples
+        self.emitted_keys.append(candidate["key"])
         return {
             "type": "predict",
             "message": "prediction emitted",
@@ -717,8 +850,8 @@ class InferenceStatusWindow:
         self.QtCore = QtCore
         self.engine = engine
         self.widget = QtWidgets.QWidget()
-        self.widget.setWindowTitle("EMG Real-Time Inference")
-        self.widget.resize(620, 420)
+        self.widget.setWindowTitle("EMG Keyboard Training Interface")
+        self.widget.resize(780, 680)
 
         root = QtWidgets.QVBoxLayout(self.widget)
         root.setSpacing(10)
@@ -769,6 +902,21 @@ class InferenceStatusWindow:
         self.lbl_top.setStyleSheet("font-size: 15px; color: #333;")
         root.addWidget(self.lbl_top)
 
+        self.lbl_history = QtWidgets.QLabel("Emitted keys: -")
+        self.lbl_history.setWordWrap(True)
+        self.lbl_history.setStyleSheet(
+            "font-size: 16px; font-weight: bold; color: #263238; "
+            "background: #fafafa; border: 1px solid #d6dde2; border-radius: 6px; padding: 8px;"
+        )
+        root.addWidget(self.lbl_history)
+
+        self.key_hold_seconds = max(0.0, engine.args.gui_key_hold_ms / 1000.0)
+        self.held_key = "-"
+        self.held_until = 0.0
+
+        self.keyboard = VirtualKeyboardWidget(engine.args.gui_key_hold_ms)
+        root.addWidget(self.keyboard.widget)
+
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -804,12 +952,25 @@ class InferenceStatusWindow:
 
     def update_state(self, state):
         state_type = state.get("type", "idle")
-        key = state.get("key", "-") if state_type in {"predict", "pending", "skip"} else "-"
+        now = time.time()
+        current_key = state.get("key", "-") if state_type in {"predict", "pending", "skip"} else "-"
         confidence = state.get("confidence", 0.0)
         margin = state.get("margin", 0.0)
         progress = int(state.get("progress", 1.0) * 100)
 
-        self.lbl_key.setText(key)
+        if state_type == "predict":
+            self.held_key = current_key
+            self.held_until = now + self.key_hold_seconds
+            display_key = current_key
+            display_state = "predict"
+        elif now < self.held_until:
+            display_key = self.held_key
+            display_state = "predict"
+        else:
+            display_key = current_key
+            display_state = state_type
+
+        self.lbl_key.setText(display_key)
         self.lbl_status.setText(state.get("message", state_type))
         self.lbl_rms.setText(f"{state.get('rms', 0.0):.1f}")
         self.lbl_threshold.setText(f"{state.get('threshold', 0.0):.1f}")
@@ -820,6 +981,8 @@ class InferenceStatusWindow:
         self.lbl_count.setText(str(state.get("count", self.engine.prediction_count)))
         self.lbl_cooldown.setText(str(state.get("cooldown", 0)))
         self.lbl_top.setText(f"Top candidates: {state.get('top', '-')}")
+        self.lbl_history.setText(f"Emitted keys: {state.get('emitted_history') or '-'}")
+        self.keyboard.update_state(state)
 
         if state_type in {"calibrating", "active_calibrating"}:
             self.progress.setValue(progress)
@@ -833,12 +996,12 @@ class InferenceStatusWindow:
             self.progress.setValue(100)
             self.progress.setFormat("Ready")
 
-        if state_type == "predict":
+        if display_state == "predict":
             self.lbl_key.setStyleSheet(
                 "font-size: 72px; font-weight: bold; color: #1b5e20; "
                 "background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 6px;"
             )
-        elif state_type in {"skip", "pending"}:
+        elif display_state in {"skip", "pending"}:
             self.lbl_key.setStyleSheet(
                 "font-size: 72px; font-weight: bold; color: #e65100; "
                 "background: #fff3e0; border: 1px solid #ffcc80; border-radius: 6px;"
@@ -850,16 +1013,181 @@ class InferenceStatusWindow:
             )
 
 
+class VirtualKeyboardWidget:
+    """예측된 키 위치를 화면 키보드에 표시하는 훈련용 피드백 패널."""
+
+    KEY_ROWS = [
+        ["y", "u", "i", "o", "p", "[", "]", "\\"],
+        ["h", "j", "k", "l", ";", "'"],
+        ["n", "m", ",", ".", "/"],
+    ]
+
+    def __init__(self, key_hold_ms=1200):
+        from pyqtgraph.Qt import QtCore, QtWidgets
+
+        self.QtCore = QtCore
+        self.buttons = {}
+        self.key_hold_seconds = max(0.0, key_hold_ms / 1000.0)
+        self.held_key = None
+        self.held_until = 0.0
+        self.widget = QtWidgets.QGroupBox("Virtual Keyboard Feedback")
+        self.widget.setStyleSheet(
+            "QGroupBox { font-size: 15px; font-weight: bold; color: #263238; }"
+        )
+
+        root = QtWidgets.QVBoxLayout(self.widget)
+        root.setSpacing(8)
+
+        self.lbl_hint = QtWidgets.QLabel(
+            "Recognized sEMG candidates are highlighted on the keyboard layout."
+        )
+        self.lbl_hint.setStyleSheet("font-size: 13px; color: #546e7a;")
+        root.addWidget(self.lbl_hint)
+
+        for row_idx, row_keys in enumerate(self.KEY_ROWS):
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(6)
+            row.setContentsMargins(row_idx * 28, 0, 0, 0)
+            for key in row_keys:
+                key_label = QtWidgets.QLabel(self._display_key(key))
+                key_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                key_label.setFixedSize(72, 48)
+                key_label.setStyleSheet(self._style("default"))
+                row.addWidget(key_label)
+                self.buttons[key] = key_label
+            row.addStretch(1)
+            root.addLayout(row)
+
+        self.lbl_feedback = QtWidgets.QLabel("Waiting for EMG input")
+        self.lbl_feedback.setStyleSheet("font-size: 14px; color: #37474f;")
+        root.addWidget(self.lbl_feedback)
+
+        legend = QtWidgets.QHBoxLayout()
+        legend.setSpacing(8)
+        for label, state in [
+            ("Emitted", "predict"),
+            ("Top candidate", "top1"),
+            ("Pending", "pending"),
+            ("Skipped", "skip"),
+            ("Calibration", "active_calibrating"),
+        ]:
+            legend.addWidget(self._make_legend_chip(label, state))
+        legend.addStretch(1)
+        root.addLayout(legend)
+
+    def _make_legend_chip(self, label, state):
+        from pyqtgraph.Qt import QtWidgets
+
+        chip = QtWidgets.QLabel(label)
+        chip.setAlignment(self.QtCore.Qt.AlignmentFlag.AlignCenter)
+        chip.setFixedHeight(26)
+        chip.setMinimumWidth(94)
+        chip.setStyleSheet(
+            self._style(state).replace("font-size: 22px;", "font-size: 12px;")
+        )
+        return chip
+
+    def update_state(self, state):
+        self._reset()
+        now = time.time()
+        state_type = state.get("type", "idle")
+        key = state.get("key")
+        top_candidates = self._parse_top_candidates(state.get("top", ""))
+
+        if state_type == "predict" and key:
+            self.held_key = key
+            self.held_until = now + self.key_hold_seconds
+
+        for rank, candidate_key in enumerate(top_candidates):
+            if candidate_key in self.buttons:
+                self.buttons[candidate_key].setStyleSheet(self._style(f"top{rank + 1}"))
+
+        if now < self.held_until and self.held_key in self.buttons:
+            self.buttons[self.held_key].setStyleSheet(self._style("predict"))
+
+        if key in self.buttons and state_type in {"predict", "pending", "skip", "active_calibrating"}:
+            self.buttons[key].setStyleSheet(self._style(state_type))
+
+        if state_type == "predict":
+            self.lbl_feedback.setText(
+                f"Emitted key: {self._display_key(key)} "
+                f"({state.get('confidence', 0.0) * 100:.1f}%)"
+            )
+        elif state_type in {"pending", "skip", "active_calibrating"} and key:
+            self.lbl_feedback.setText(
+                f"Current candidate: {self._display_key(key)} "
+                f"({state.get('confidence', 0.0) * 100:.1f}%)"
+            )
+        elif state_type == "calibrating":
+            self.lbl_feedback.setText("Keep hand relaxed for threshold calibration")
+        elif state_type == "cooldown":
+            if now < self.held_until and self.held_key:
+                self.lbl_feedback.setText(f"Last emitted key: {self._display_key(self.held_key)}")
+            else:
+                self.lbl_feedback.setText("Cooldown: holding output to prevent duplicates")
+        elif state_type == "end":
+            self.lbl_feedback.setText("Replay or calibration finished")
+        else:
+            self.lbl_feedback.setText("Waiting for EMG input")
+
+    def _reset(self):
+        for key_label in self.buttons.values():
+            key_label.setStyleSheet(self._style("default"))
+
+    def _parse_top_candidates(self, top_text):
+        if not top_text or top_text == "-":
+            return []
+        keys = []
+        for item in top_text.split(","):
+            key = item.split(":", 1)[0].strip()
+            if key:
+                keys.append(key)
+        return keys[:3]
+
+    def _display_key(self, key):
+        if key == "\\":
+            return "\\"
+        if key == " ":
+            return "Space"
+        return str(key)
+
+    def _style(self, state):
+        base = (
+            "font-size: 22px; font-weight: bold; border-radius: 6px; "
+            "border: 1px solid {border}; color: {color}; background: {bg};"
+        )
+        colors = {
+            "default": {"bg": "#fafafa", "border": "#cfd8dc", "color": "#263238"},
+            "top1": {"bg": "#e3f2fd", "border": "#64b5f6", "color": "#0d47a1"},
+            "top2": {"bg": "#eef7ff", "border": "#90caf9", "color": "#1565c0"},
+            "top3": {"bg": "#f7fbff", "border": "#bbdefb", "color": "#1976d2"},
+            "predict": {"bg": "#c8e6c9", "border": "#43a047", "color": "#1b5e20"},
+            "pending": {"bg": "#fff3e0", "border": "#fb8c00", "color": "#e65100"},
+            "skip": {"bg": "#ffebee", "border": "#e57373", "color": "#b71c1c"},
+            "active_calibrating": {"bg": "#ede7f6", "border": "#7e57c2", "color": "#4527a0"},
+        }
+        return base.format(**colors.get(state, colors["default"]))
+
+
 def run_gui(args):
     from pyqtgraph.Qt import QtWidgets
 
     app = QtWidgets.QApplication([])
     engine = EMGRealTimeInference(args)
-    engine.wait_for_connection()
-    window = InferenceStatusWindow(engine)
-    app.aboutToQuit.connect(engine.logger.close)
-    window.show(args.gui_interval_ms)
-    app.exec_()
+    try:
+        engine.wait_for_connection()
+        window = InferenceStatusWindow(engine)
+        app.aboutToQuit.connect(engine.logger.close)
+        window.show(args.gui_interval_ms)
+        if hasattr(app, "exec"):
+            app.exec()
+        else:
+            app.exec_()
+    except KeyboardInterrupt:
+        print("\n[STOP] Interrupted by user.")
+    finally:
+        engine.receiver.close()
+        engine.logger.close()
 
 
 def parse_args():
@@ -892,6 +1220,7 @@ def parse_args():
     parser.add_argument("--gui", action="store_true", default=INFERENCE_GUI)
     parser.add_argument("--no-gui", action="store_false", dest="gui")
     parser.add_argument("--gui-interval-ms", type=int, default=INFERENCE_GUI_INTERVAL_MS)
+    parser.add_argument("--gui-key-hold-ms", type=int, default=INFERENCE_GUI_KEY_HOLD_MS)
     parser.add_argument("--log", action="store_true", default=INFERENCE_LOG_ENABLED)
     parser.add_argument("--no-log", action="store_false", dest="log")
     parser.add_argument("--log-dir", default=INFERENCE_LOG_DIR)
@@ -911,6 +1240,9 @@ def parse_args():
     parser.add_argument("--replay-realtime", action="store_true", default=INFERENCE_REPLAY_REALTIME)
     parser.add_argument("--no-replay-realtime", action="store_false", dest="replay_realtime")
     parser.add_argument("--replay-speed", type=float, default=INFERENCE_REPLAY_SPEED)
+    parser.add_argument("--replay-auto-threshold", action="store_true", default=INFERENCE_REPLAY_AUTO_THRESHOLD)
+    parser.add_argument("--no-replay-auto-threshold", action="store_false", dest="replay_auto_threshold")
+    parser.add_argument("--replay-threshold-percentile", type=float, default=INFERENCE_REPLAY_THRESHOLD_PERCENTILE)
     args = parser.parse_args()
     if args.buffer_size < args.window_size:
         parser.error("--buffer-size must be greater than or equal to --window-size")
