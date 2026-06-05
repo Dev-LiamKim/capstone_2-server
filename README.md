@@ -1,41 +1,44 @@
-# EMG Keyboard Classifier
+# EMG 키보드 분류기
 
-8-channel EMG data collection and right-hand keyboard classification project.
+8채널 근전도(EMG) 신호를 ESP32에서 TCP로 수신하고, 오른손 키 입력을 분류하는 프로젝트입니다.
 
-This repository contains tools for:
+이 프로젝트는 다음 기능을 포함합니다.
 
-- receiving EMG samples from an ESP32 over TCP
-- visualizing raw and processed EMG signals in real time
-- recording key-labeled CSV datasets through a typing practice UI
-- training a PyTorch CNN+LSTM classifier
-- analyzing dataset/event quality
+- ESP32로부터 EMG 샘플 실시간 수신
+- 원신호 및 전처리 신호 실시간 시각화
+- 타이핑 연습 UI를 통한 키 라벨 CSV 데이터셋 기록
+- PyTorch 기반 CNN+LSTM 모델 학습
+- 데이터셋 이벤트 및 동기화 품질 분석
+- 학습된 모델을 이용한 실시간 추론
 
-## Project Structure
+## 프로젝트 구조
 
 ```text
 .
-├── main.py                 # Real-time EMG collector app
-├── network.py              # TCP receiver for ESP32 packets
-├── gui.py                  # PyQtGraph signal visualizer
-├── typing_practice.py      # Key prompt UI and CSV event recording
-├── train.py                # PyTorch training pipeline
-├── inference.py            # Legacy TensorFlow/Keras inference script
-├── analyzer.py             # Dataset event count analyzer
-├── check_class_jitter.py   # Event-to-peak jitter analysis
-├── check_sync_pure.py      # Class-wise physical peak report
-├── config.py               # Shared constants and key mapping
+├── main.py                 # 실시간 EMG 수집 앱
+├── network.py              # ESP32 TCP 패킷 수신기
+├── gui.py                  # PyQtGraph 신호 시각화
+├── typing_practice.py      # 키 입력 연습 UI 및 이벤트 기록
+├── train.py                # PyTorch 학습 파이프라인
+├── models.py               # 추론/학습 공용 모델 정의
+├── inference.py            # PyTorch 실시간 추론 스크립트
+├── analyzer.py             # 데이터셋 이벤트 개수 분석
+├── check_class_jitter.py   # 이벤트-피크 지터 분석
+├── check_sync_pure.py      # 클래스별 물리 피크 리포트
+├── esp32-simulator.py      # 센서 없이 TCP 수신 흐름을 테스트하는 ESP32 시뮬레이터
+├── config.py               # 공통 설정 및 키 매핑
 └── requirements.txt
 ```
 
-## Data and Model Artifacts
+## 데이터와 결과물
 
-Datasets and experiment reports can be committed with this project:
+다음 디렉터리는 실험 재현을 위해 Git에 포함할 수 있습니다.
 
 - `dataset/`
 - `new_dataset/`
 - `results/`
 
-Local runtime artifacts and model checkpoints are intentionally excluded from Git:
+다음 파일은 로컬 실행 산출물이므로 기본적으로 Git에서 제외합니다.
 
 - `*.pt`
 - `*.keras`
@@ -43,9 +46,9 @@ Local runtime artifacts and model checkpoints are intentionally excluded from Gi
 - `*.db`
 - `*.docx`
 
-Keep trained model files in the project directory when running experiments, but avoid committing them unless a release artifact is intentionally needed.
+학습된 모델 파일은 실험 및 추론 실행을 위해 프로젝트 루트에 둘 수 있습니다. 단, 릴리즈 산출물로 공유할 목적이 아니라면 일반 커밋에는 포함하지 않는 것을 권장합니다.
 
-## Setup
+## 설치
 
 ```powershell
 python -m venv venv
@@ -53,32 +56,32 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-If installing CUDA-enabled PyTorch fails from `requirements.txt`, install the PyTorch build matching your local CUDA version from the official PyTorch instructions, then install the remaining requirements.
+`requirements.txt`로 CUDA 지원 PyTorch 설치가 실패하면, 사용 중인 CUDA 버전에 맞는 PyTorch를 공식 안내에 따라 먼저 설치한 뒤 나머지 패키지를 설치하면 됩니다.
 
-## Collect Data
+## 데이터 수집
 
-Run the collector and connect the ESP32 client to `SERVER_PORT` from `config.py`.
+ESP32 클라이언트를 `config.py`의 `SERVER_PORT`로 연결한 뒤 수집 앱을 실행합니다.
 
 ```powershell
 .\venv\Scripts\python.exe main.py
 ```
 
-The app opens:
+앱을 실행하면 다음 창이 열립니다.
 
-- a real-time EMG signal visualizer
-- a typing practice window for event labeling
+- 실시간 EMG 신호 시각화 창
+- 키 라벨 기록을 위한 타이핑 연습 창
 
-Successful sessions are saved as CSV files under `dataset/`.
+수집이 완료된 세션은 CSV 파일로 `dataset/` 또는 지정된 데이터셋 디렉터리에 저장됩니다.
 
-## Train
+## 학습
 
-The current best experiment used `new_dataset`, a 200-sample window, 80 pre-event samples, and 20 Hz high-pass filtering.
+현재 가장 좋은 결과를 낸 조건은 `new_dataset`, 200 샘플 윈도우, 이벤트 이전 80 샘플, 20 Hz 하이패스 필터, CNN+LSTM 모델입니다.
 
 ```powershell
 .\venv\Scripts\python.exe train.py --dataset-dir new_dataset --seed 42 --window-size 200 --pre-event 80 --max-epochs 80 --patience 8 --filter-mode highpass_20 --model cnn_lstm
 ```
 
-Useful options:
+주요 옵션은 다음과 같습니다.
 
 ```text
 --dataset-dir
@@ -93,7 +96,7 @@ Useful options:
 --patience
 ```
 
-Training writes:
+학습이 끝나면 다음 결과물이 생성됩니다.
 
 - `best_emg_model.pt`
 - `results/runs/<timestamp>/report.txt`
@@ -101,48 +104,106 @@ Training writes:
 - `results/runs/<timestamp>/training_history.png`
 - `results/runs/<timestamp>/confusion_matrix.png`
 
-## Real-Time Inference
+## 실시간 추론
 
-Run real-time inference with the trained PyTorch model:
+근전도 센서와 ESP32를 연결한 상태에서 `inference.py`를 실행하면, TCP로 들어오는 EMG 데이터를 받아 실시간으로 키를 예측합니다.
+
+기본 실행:
+
+```powershell
+.\venv\Scripts\python.exe inference.py
+```
+
+상태 GUI와 함께 실행:
+
+```powershell
+.\venv\Scripts\python.exe inference.py --gui
+```
+
+GUI 모드에서는 현재 예측 키와 상태 정보뿐 아니라, 오른손 키 영역의 가상 키보드가 함께 표시됩니다. 모델이 인식한 후보 키와 최종 출력 키가 키보드 위치에 하이라이트되므로, 사용자가 어떤 근육 수축이 어떤 키로 인식되는지 즉시 확인하며 훈련할 수 있습니다.
+
+GUI 키보드 색상은 다음 의미를 가집니다.
+
+- 초록색: 최종 입력으로 확정된 키
+- 파란색 계열: 모델의 top-k 후보 키
+- 주황색: 후보로 감지됐지만 아직 확정 전인 키
+- 빨간색: confidence 또는 margin 조건을 만족하지 못해 무시된 키
+- 보라색: active calibration 중 감지된 후보 키
+
+모델 경로, 윈도우 크기, 필터 모드를 직접 지정해서 실행할 수도 있습니다.
 
 ```powershell
 .\venv\Scripts\python.exe inference.py --model-path best_emg_model.pt --window-size 200 --filter-mode highpass_20
 ```
 
-Run with the status GUI:
+`inference.py`는 다음 순서로 동작합니다.
+
+1. `network.py`의 `EMGReceiver`를 통해 ESP32 TCP 클라이언트 연결을 대기합니다.
+2. 수신한 8채널 EMG 데이터를 rolling buffer에 저장합니다.
+3. 설정된 streaming filter를 적용합니다.
+4. 초반 안정 상태 RMS를 이용해 trigger threshold를 자동 보정합니다.
+5. threshold를 넘는 구간에서 최근 윈도우를 모델에 입력합니다.
+6. confidence, margin, vote window, cooldown 조건을 거쳐 예측 결과를 출력합니다.
+
+GUI를 사용하지 않으면 추론 결과는 터미널에 출력됩니다. `--gui` 옵션을 사용하면 별도 PyQt 상태 창에 최근 예측 결과, 신뢰도, RMS 상태가 표시됩니다.
+
+추론을 실행하면 기본적으로 `inference_logs/` 아래에 CSV 로그가 저장됩니다. 로그에는 RMS, threshold, 상태, 예측 키, confidence, margin, top-k 후보, cooldown 정보가 기록됩니다. 로그 저장을 끄고 싶으면 다음처럼 실행합니다.
 
 ```powershell
-.\venv\Scripts\python.exe inference.py --gui --model-path best_emg_model.pt --window-size 200 --filter-mode highpass_20
+.\venv\Scripts\python.exe inference.py --no-log
 ```
 
-The script waits for the ESP32 TCP client on `SERVER_PORT` from `config.py`, keeps a rolling signal buffer, applies the selected streaming filter, calibrates the RMS trigger threshold, stabilizes repeated predictions with a short vote window, and prints or displays predicted keys.
+센서 없이 저장된 CSV를 재생하면서 추론 파이프라인을 테스트할 수도 있습니다.
 
-Useful options:
-
-```text
---gui                 Show a PyQt status window
---threshold           Manual RMS fallback threshold, default 80000
---manual-threshold    Disable automatic threshold calibration
---calibration-seconds Idle calibration duration, default 3.0
---threshold-multiplier threshold = idle_mean + multiplier * idle_std
---min-confidence      Minimum softmax confidence, default 0.35
---min-margin          Minimum top-1 minus top-2 confidence margin, default 0.10
---vote-window         Number of recent candidates to vote over, default 3
---min-votes           Required votes for one emitted prediction, default 2
---cooldown-samples    Samples to wait after a prediction, default 200
---print-rms           Print recent RMS once per interval
---device              auto, cpu, or cuda
+```powershell
+.\venv\Scripts\python.exe inference.py --replay-csv new_dataset\recording_20260529_193249.csv --no-replay-realtime
 ```
 
-The same defaults can be edited in `config.py` under the real-time inference section. CLI options override `config.py` for one-off tests.
+이 방식은 CSV를 `inference.py` 내부에서 직접 읽기 때문에 모델 추론, threshold, smoothing, GUI, 로그 기능을 빠르게 확인할 때 적합합니다.
+CSV에 `Event` 컬럼이 있으면 기본적으로 전체 dataset의 RMS 분포와 라벨을 이용해 idle/active를 가장 잘 구분하는 threshold를 자동으로 설정합니다.
 
-Common `config.py` values for testers:
+실제 수신 속도에 맞춰 재생하려면 `--replay-realtime`을 사용하고, 반복 재생하려면 `--replay-loop`을 함께 사용합니다.
+
+```powershell
+.\venv\Scripts\python.exe inference.py --replay-csv new_dataset\recording_20260529_193249.csv --replay-realtime --replay-loop
+```
+
+GUI에서 최종 입력 키가 너무 빨리 지나가면 `--gui-key-hold-ms`로 하이라이트 유지 시간을 늘릴 수 있습니다.
+
+```powershell
+.\venv\Scripts\python.exe inference.py --gui --replay-csv new_dataset\recording_20260529_193249.csv --replay-realtime --replay-speed 0.5 --gui-key-hold-ms 2000
+```
+
+센서 없이 실제 TCP 수신 구조까지 테스트하려면 `inference.py`를 먼저 실행한 뒤, 다른 터미널에서 `esp32-simulator.py`를 실행합니다.
+
+```powershell
+.\venv\Scripts\python.exe inference.py
+```
+
+```powershell
+.\venv\Scripts\python.exe esp32-simulator.py
+```
+
+이 방식은 `esp32-simulator.py`가 CSV 데이터를 실제 ESP32처럼 TCP 바이너리 패킷으로 보내고, `inference.py`가 `network.py`를 통해 수신하므로 실제 센서 연결 흐름에 더 가깝습니다.
+
+## 추론 설정
+
+실시간 추론 파라미터는 `config.py`의 `INFERENCE_*` 항목에서 수정할 수 있습니다. CLI 옵션으로 넘긴 값은 `config.py` 값보다 우선 적용됩니다.
+
+자주 조정하는 값은 다음과 같습니다.
 
 ```python
-INFERENCE_GUI = True
+INFERENCE_GUI = False
+INFERENCE_GUI_INTERVAL_MS = 10
+INFERENCE_GUI_KEY_HOLD_MS = 1200
+INFERENCE_LOG_ENABLED = True
+INFERENCE_LOG_DIR = "inference_logs"
+INFERENCE_LOG_ALL_STATES = True
+INFERENCE_MODEL_PATH = "best_emg_model.pt"
+INFERENCE_MODEL_TYPE = "cnn_lstm"
 INFERENCE_FILTER_MODE = "highpass_20"
 INFERENCE_WINDOW_SIZE = 200
-INFERENCE_AUTO_THRESHOLD = True
+INFERENCE_AUTO_THRESHOLD = False
 INFERENCE_THRESHOLD = 80000.0
 INFERENCE_CALIBRATION_SECONDS = 3.0
 INFERENCE_THRESHOLD_MULTIPLIER = 4.0
@@ -151,25 +212,56 @@ INFERENCE_MIN_MARGIN = 0.10
 INFERENCE_VOTE_WINDOW = 3
 INFERENCE_MIN_VOTES = 2
 INFERENCE_COOLDOWN_SAMPLES = 200
+INFERENCE_CALIBRATION_MODE = False
+INFERENCE_ACTIVE_CALIBRATION_SECONDS = 6.0
+INFERENCE_REPLAY_CSV = ""
+INFERENCE_REPLAY_AUTO_THRESHOLD = True
+INFERENCE_REPLAY_THRESHOLD_PERCENTILE = 75.0
 ```
 
-Threshold calibration example:
+센서에서 실시간으로 수신할 때 `--auto-threshold`를 사용하면 연결 직후의 안정 상태 RMS를 이용해 threshold를 설정합니다.
+
+```text
+threshold = idle_mean + INFERENCE_THRESHOLD_MULTIPLIER * idle_std
+```
+
+CSV 리플레이에서는 `INFERENCE_REPLAY_AUTO_THRESHOLD=True`가 기본값입니다. `Event` 컬럼이 있는 dataset은 batch별 RMS와 라벨을 비교해 idle/active를 가장 잘 분리하는 threshold를 자동으로 선택합니다. 라벨이 없는 CSV는 `INFERENCE_REPLAY_THRESHOLD_PERCENTILE` 값에 해당하는 RMS percentile을 fallback으로 사용합니다. 이 기능을 끄고 수동 threshold를 쓰려면 다음처럼 실행합니다.
+
+```powershell
+.\venv\Scripts\python.exe inference.py --replay-csv new_dataset\recording_20260529_193249.csv --no-replay-auto-threshold --threshold 80000
+```
+
+`INFERENCE_THRESHOLD = 80000.0`은 자동 보정이 꺼졌거나 보정에 실패했을 때 사용하는 fallback 값입니다. 실제 센서 착용 상태, 전극 접촉, 사용자, 움직임 강도에 따라 적정 값이 달라질 수 있으므로 테스트 환경에서는 RMS를 확인한 뒤 조정하는 것이 좋습니다.
+
+RMS 확인용 실행 예시는 다음과 같습니다.
 
 ```powershell
 .\venv\Scripts\python.exe inference.py --print-rms --manual-threshold --threshold 999999999
 ```
 
-Watch the idle RMS and typing RMS, then rerun with a threshold between those two ranges.
+이 상태에서 안정 상태 RMS와 실제 키 입력 시 RMS를 비교한 뒤, 두 범위 사이의 값을 수동 threshold로 지정할 수 있습니다.
 
-## Current Best Result
+캘리브레이션 모드를 사용하면 안정 상태 보정 이후 몇 초 동안 키를 눌러보며 active RMS, confidence, margin을 수집하고 추천 threshold를 출력합니다.
 
-See the local report:
+```powershell
+.\venv\Scripts\python.exe inference.py --calibration-mode
+```
+
+캘리브레이션 리포트만 확인하고 종료하려면 다음처럼 실행합니다.
+
+```powershell
+.\venv\Scripts\python.exe inference.py --calibration-mode --calibration-only
+```
+
+## 현재 최고 성능
+
+자세한 내용은 로컬 실험 보고서를 참고합니다.
 
 ```text
 EMG_모델_개선_실험_보고서_20260601.md
 ```
 
-Summary:
+요약:
 
 - Dataset: `new_dataset`
 - Model: CNN+LSTM
@@ -178,6 +270,10 @@ Summary:
 - Filter: high-pass 20 Hz
 - Test Accuracy: 76.84%
 
-## Notes
+## 참고 사항
 
-`inference.py` uses the PyTorch model (`best_emg_model.pt`) trained by `train.py`.
+- `network.py`는 ESP32에서 전송되는 EMG 바이너리 패킷을 수신하는 역할을 합니다.
+- `inference.py`는 `network.py`로 들어온 실시간 데이터를 모델 입력 형태로 변환하고 예측을 수행합니다.
+- `esp32-simulator.py`는 센서 없이 `network.py`의 TCP 수신 구조를 검증할 때 사용하는 선택적 테스트 도구입니다.
+- ESP32 데이터 형식은 8채널, batch size 32, little-endian int32 기준입니다.
+- 실시간 추론에는 `train.py`로 학습한 PyTorch 모델 파일인 `best_emg_model.pt`가 필요합니다.

@@ -3,20 +3,34 @@ import struct
 import numpy as np
 from config import PACKET_SIZE, BATCH_SIZE, CHANNELS
 
+
 class EMGReceiver:
     def __init__(self, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.bind(('0.0.0.0', port))
         self.sock.listen(1)
+        # accept()를 무한 blocking으로 두면 Windows 터미널에서 Ctrl+C가 즉시 처리되지
+        # 않을 수 있으므로 짧은 timeout을 두고 반복 확인합니다.
+        self.sock.settimeout(0.5)
         self.conn = None
         self.buffer = b''  # 데이터 보존용 누적 버퍼 추가
 
     def wait_for_connection(self):
         print("ESP32 접속 대기 중...")
-        self.conn, addr = self.sock.accept()
-        self.conn.setblocking(False)
-        return addr
+        while True:
+            try:
+                self.conn, addr = self.sock.accept()
+                self.conn.setblocking(False)
+                return addr
+            except socket.timeout:
+                continue
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+        self.sock.close()
 
     def receive_batch(self):
         try:
