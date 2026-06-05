@@ -1,6 +1,9 @@
 import argparse
+import csv
+import os
 import time
 from collections import Counter, deque
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -17,12 +20,22 @@ from config import (
     INFERENCE_FILTER_MODE,
     INFERENCE_GUI,
     INFERENCE_GUI_INTERVAL_MS,
+    INFERENCE_ACTIVE_CALIBRATION_SECONDS,
+    INFERENCE_CALIBRATION_MODE,
+    INFERENCE_CALIBRATION_ONLY,
+    INFERENCE_LOG_ALL_STATES,
+    INFERENCE_LOG_DIR,
+    INFERENCE_LOG_ENABLED,
     INFERENCE_MIN_CONFIDENCE,
     INFERENCE_MIN_MARGIN,
     INFERENCE_MIN_VOTES,
     INFERENCE_MODEL_PATH,
     INFERENCE_MODEL_TYPE,
     INFERENCE_PRINT_RMS,
+    INFERENCE_REPLAY_CSV,
+    INFERENCE_REPLAY_LOOP,
+    INFERENCE_REPLAY_REALTIME,
+    INFERENCE_REPLAY_SPEED,
     INFERENCE_RMS_LOG_INTERVAL,
     INFERENCE_THRESHOLD,
     INFERENCE_THRESHOLD_MULTIPLIER,
@@ -42,6 +55,127 @@ from models import CNNLSTM, ResNet1D
 NUM_CLASSES = len(set(RIGHT_HAND_KEYS.values()))
 
 
+class ReplayEMGReceiver:
+    def __init__(self, csv_path, sample_rate, speed=1.0, loop=False, realtime=True):
+        self.csv_path = csv_path
+        self.sample_rate = sample_rate
+        self.speed = max(0.01, speed)
+        self.loop = loop
+        self.realtime = realtime
+        self.cursor = 0
+        self.last_emit = None
+        self.samples = self._load_samples(csv_path)
+
+    def _load_samples(self, csv_path):
+        data = np.loadtxt(
+            csv_path,
+            delimiter=",",
+            skiprows=1,
+            usecols=range(CHANNELS),
+            dtype=np.float32,
+        )
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        if data.shape[1] != CHANNELS:
+            raise ValueError(f"Replay CSV must contain CH0..CH{CHANNELS - 1} columns.")
+        return data
+
+    def wait_for_connection(self):
+        print(f"[REPLAY] loaded {len(self.samples)} samples from {self.csv_path}")
+        return ("replay", os.path.abspath(self.csv_path))
+
+    def receive_batch(self):
+        if self.cursor + BATCH_SIZE > len(self.samples):
+            if not self.loop:
+                raise EOFError("Replay finished.")
+            self.cursor = 0
+            self.last_emit = None
+
+        if self.realtime:
+            now = time.time()
+            if self.last_emit is not None:
+                target_interval = (BATCH_SIZE / self.sample_rate) / self.speed
+                elapsed = now - self.last_emit
+                if elapsed < target_interval:
+                    time.sleep(target_interval - elapsed)
+            self.last_emit = time.time()
+
+        batch = self.samples[self.cursor : self.cursor + BATCH_SIZE].T
+        self.cursor += BATCH_SIZE
+        return batch
+
+
+class InferenceLogger:
+    def __init__(self, enabled, log_dir, log_all_states, source_name):
+        self.enabled = enabled
+        self.log_all_states = log_all_states
+        self.started_at = time.time()
+        self.path = None
+        self.file = None
+        self.writer = None
+        if not enabled:
+            return
+
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_source = source_name.replace(os.sep, "_").replace(":", "_")
+        self.path = os.path.join(log_dir, f"inference_{timestamp}_{safe_source}.csv")
+        self.file = open(self.path, mode="w", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(
+            self.file,
+            fieldnames=[
+                "timestamp",
+                "elapsed_sec",
+                "source",
+                "state",
+                "message",
+                "rms",
+                "threshold",
+                "progress",
+                "key",
+                "raw_id",
+                "confidence",
+                "margin",
+                "top",
+                "emitted_count",
+                "cooldown_remaining",
+            ],
+        )
+        self.writer.writeheader()
+        print(f"[LOG] writing inference log to {self.path}")
+
+    def log(self, state):
+        if not self.enabled or self.writer is None:
+            return
+        state_type = state.get("type", "")
+        if not self.log_all_states and state_type not in {"predict", "skip", "pending", "end"}:
+            return
+        row = {
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "elapsed_sec": f"{time.time() - self.started_at:.3f}",
+            "source": state.get("source", ""),
+            "state": state_type,
+            "message": state.get("message", ""),
+            "rms": f"{state.get('rms', 0.0):.3f}",
+            "threshold": f"{state.get('threshold', 0.0):.3f}",
+            "progress": f"{state.get('progress', 0.0):.3f}",
+            "key": state.get("key", ""),
+            "raw_id": state.get("raw_id", ""),
+            "confidence": f"{state.get('confidence', 0.0):.6f}",
+            "margin": f"{state.get('margin', 0.0):.6f}",
+            "top": state.get("top", ""),
+            "emitted_count": state.get("count", ""),
+            "cooldown_remaining": state.get("cooldown", ""),
+        }
+        self.writer.writerow(row)
+        self.file.flush()
+
+    def close(self):
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+
+
 class ThresholdCalibrator:
     def __init__(self, enabled, duration_sec, multiplier, fallback_threshold):
         self.enabled = enabled and duration_sec > 0
@@ -52,6 +186,7 @@ class ThresholdCalibrator:
         self.samples = []
         self.threshold = fallback_threshold
         self.done = not self.enabled
+        self.stats = None
 
     def update(self, rms):
         if self.done:
@@ -65,6 +200,12 @@ class ThresholdCalibrator:
         if now - self.started_at >= self.duration_sec and self.samples:
             mean = float(np.mean(self.samples))
             std = float(np.std(self.samples))
+            self.stats = {
+                "mean": mean,
+                "std": std,
+                "min": float(np.min(self.samples)),
+                "max": float(np.max(self.samples)),
+            }
             self.threshold = mean + self.multiplier * std
             self.done = True
             print(
@@ -169,7 +310,18 @@ class EMGRealTimeInference:
     def __init__(self, args):
         self.args = args
         self.device = self._select_device(args.device)
-        self.receiver = EMGReceiver(args.port)
+        if args.replay_csv:
+            self.receiver = ReplayEMGReceiver(
+                csv_path=args.replay_csv,
+                sample_rate=args.sample_rate,
+                speed=args.replay_speed,
+                loop=args.replay_loop,
+                realtime=args.replay_realtime,
+            )
+            self.source_name = "replay"
+        else:
+            self.receiver = EMGReceiver(args.port)
+            self.source_name = "tcp"
         self.model = self._load_model(args.model_path, args.model)
         self.model.eval()
 
@@ -196,12 +348,25 @@ class EMGRealTimeInference:
         self.connected_addr = None
         self.last_rms_log = time.time()
         self.prediction_count = 0
+        self.done = False
+        self.active_calibration_started_at = None
+        self.active_calibration_seconds = max(0.001, args.active_calibration_seconds)
+        self.active_rms_samples = []
+        self.active_candidates = []
+        self.active_calibration_done = not args.calibration_mode
+        self.logger = InferenceLogger(
+            enabled=args.log,
+            log_dir=args.log_dir,
+            log_all_states=args.log_all_states,
+            source_name=self.source_name,
+        )
         self.last_status = {
             "type": "boot",
             "message": "model loaded",
             "rms": 0.0,
             "threshold": self.threshold,
             "top": "-",
+            "source": self.source_name,
         }
 
     def _select_device(self, requested):
@@ -224,8 +389,11 @@ class EMGRealTimeInference:
     def run(self):
         self.wait_for_connection()
 
-        while True:
-            self.process_once()
+        try:
+            while not self.done:
+                self.process_once()
+        finally:
+            self.logger.close()
 
     def wait_for_connection(self):
         if self.args.auto_threshold:
@@ -239,12 +407,26 @@ class EMGRealTimeInference:
             "[CONFIG] "
             f"window={self.args.window_size}, filter={self.args.filter_mode}, "
             f"threshold={self.args.threshold}, cooldown={self.args.cooldown_samples}, "
-            f"votes={self.args.min_votes}/{self.args.vote_window}"
+            f"votes={self.args.min_votes}/{self.args.vote_window}, "
+            f"log={self.args.log}, calibration_mode={self.args.calibration_mode}"
         )
         return self.connected_addr
 
     def process_once(self):
-        batch = self.receiver.receive_batch()
+        try:
+            batch = self.receiver.receive_batch()
+        except EOFError:
+            self.done = True
+            return self._set_status(
+                {
+                    "type": "end",
+                    "message": "replay finished",
+                    "rms": 0.0,
+                    "threshold": self.threshold,
+                    "top": "-",
+                }
+            )
+
         if batch is None:
             return None
 
@@ -256,41 +438,54 @@ class EMGRealTimeInference:
         self.threshold = self.calibrator.update(recent_rms)
 
         if not self.calibrator.done:
-            self.last_status = {
-                "type": "calibrating",
-                "message": "calibrating threshold",
-                "rms": recent_rms,
-                "threshold": self.threshold,
-                "progress": self.calibrator.progress(),
-                "top": "-",
-            }
-            return self.last_status
+            return self._set_status(
+                {
+                    "type": "calibrating",
+                    "message": "idle threshold calibration",
+                    "rms": recent_rms,
+                    "threshold": self.threshold,
+                    "progress": self.calibrator.progress(),
+                    "top": "-",
+                }
+            )
+
+        if not self.active_calibration_done:
+            return self._process_active_calibration(recent_rms)
 
         if self.cooldown > 0:
             self.cooldown = max(0, self.cooldown - BATCH_SIZE)
-            self.last_status = {
-                "type": "cooldown",
-                "message": f"cooldown {self.cooldown} samples",
-                "rms": recent_rms,
-                "threshold": self.threshold,
-                "top": "-",
-            }
-            return self.last_status
+            return self._set_status(
+                {
+                    "type": "cooldown",
+                    "message": f"cooldown {self.cooldown} samples",
+                    "rms": recent_rms,
+                    "threshold": self.threshold,
+                    "top": "-",
+                }
+            )
 
         if recent_rms < self.threshold:
-            self.last_status = {
-                "type": "idle",
-                "message": "waiting for EMG trigger",
-                "rms": recent_rms,
-                "threshold": self.threshold,
-                "top": "-",
-            }
-            return self.last_status
+            return self._set_status(
+                {
+                    "type": "idle",
+                    "message": "threshold not reached",
+                    "rms": recent_rms,
+                    "threshold": self.threshold,
+                    "top": "-",
+                }
+            )
 
         candidate = self._classify(recent_rms)
         decision = self.smoother.update(candidate)
-        self.last_status = self._handle_decision(decision, recent_rms)
-        return self.last_status
+        return self._set_status(self._handle_decision(decision, recent_rms))
+
+    def _set_status(self, state):
+        state.setdefault("source", self.source_name)
+        state.setdefault("threshold", self.threshold)
+        state.setdefault("cooldown", self.cooldown)
+        self.last_status = state
+        self.logger.log(state)
+        return state
 
     def _append_buffer(self, batch):
         self.data_buffer = np.roll(self.data_buffer, -BATCH_SIZE, axis=1)
@@ -306,6 +501,91 @@ class EMGRealTimeInference:
         if now - self.last_rms_log >= self.args.rms_log_interval:
             print(f"[RMS] {recent_rms:.1f}")
             self.last_rms_log = now
+
+    def _process_active_calibration(self, recent_rms):
+        now = time.time()
+        if self.active_calibration_started_at is None:
+            self.active_calibration_started_at = now
+            print(
+                "[CALIBRATION] Press several target keys naturally for "
+                f"{self.active_calibration_seconds:.1f}s."
+            )
+
+        elapsed = now - self.active_calibration_started_at
+        self.active_rms_samples.append(recent_rms)
+
+        candidate = None
+        if recent_rms >= self.threshold:
+            candidate = self._classify(recent_rms)
+            self.active_candidates.append(candidate)
+
+        if elapsed >= self.active_calibration_seconds:
+            self.active_calibration_done = True
+            self._print_calibration_report()
+            if self.args.calibration_only:
+                self.done = True
+                return self._set_status(
+                    {
+                        "type": "end",
+                        "message": "calibration finished",
+                        "rms": recent_rms,
+                        "threshold": self.threshold,
+                        "top": candidate["top"] if candidate else "-",
+                    }
+                )
+            print("[CALIBRATION] Finished. Switching to normal inference.")
+
+        state = {
+            "type": "active_calibrating",
+            "message": "active calibration",
+            "rms": recent_rms,
+            "threshold": self.threshold,
+            "progress": min(1.0, elapsed / self.active_calibration_seconds),
+            "top": candidate["top"] if candidate else "-",
+        }
+        if candidate:
+            state.update(candidate)
+        return self._set_status(state)
+
+    def _print_calibration_report(self):
+        idle = self.calibrator.stats or {}
+        active = np.array(self.active_rms_samples, dtype=np.float32)
+        triggered = [item for item in self.active_candidates if item["rms"] >= self.threshold]
+        active_mean = float(np.mean(active)) if len(active) else 0.0
+        active_min = float(np.min(active)) if len(active) else 0.0
+        active_max = float(np.max(active)) if len(active) else 0.0
+
+        if idle and len(active):
+            recommended_threshold = (idle.get("max", self.threshold) + active_max) / 2.0
+        else:
+            recommended_threshold = self.threshold
+
+        confidences = [item["confidence"] for item in triggered]
+        margins = [item["margin"] for item in triggered]
+        recommended_confidence = max(0.20, min(0.70, float(np.mean(confidences) * 0.65))) if confidences else self.args.min_confidence
+        recommended_margin = max(0.05, min(0.30, float(np.mean(margins) * 0.65))) if margins else self.args.min_margin
+
+        print("[CALIBRATION REPORT]")
+        if idle:
+            print(
+                "  idle_rms: "
+                f"mean={idle['mean']:.1f}, std={idle['std']:.1f}, "
+                f"min={idle['min']:.1f}, max={idle['max']:.1f}"
+            )
+        print(
+            "  active_rms: "
+            f"mean={active_mean:.1f}, min={active_min:.1f}, max={active_max:.1f}"
+        )
+        print(
+            "  triggered_predictions: "
+            f"{len(triggered)} / {len(self.active_rms_samples)} batches"
+        )
+        print(
+            "  recommended: "
+            f"threshold={recommended_threshold:.1f}, "
+            f"min_confidence={recommended_confidence:.2f}, "
+            f"min_margin={recommended_margin:.2f}"
+        )
 
     def _classify(self, recent_rms):
         window = self.data_buffer[:, -self.args.window_size:].T
@@ -431,11 +711,19 @@ class InferenceStatusWindow:
         self.lbl_threshold = self._make_value_label()
         self.lbl_confidence = self._make_value_label()
         self.lbl_margin = self._make_value_label()
+        self.lbl_state = self._make_value_label()
+        self.lbl_source = self._make_value_label()
+        self.lbl_count = self._make_value_label()
+        self.lbl_cooldown = self._make_value_label()
 
         self._add_metric(grid, 0, "RMS", self.lbl_rms)
         self._add_metric(grid, 1, "Threshold", self.lbl_threshold)
         self._add_metric(grid, 2, "Confidence", self.lbl_confidence)
         self._add_metric(grid, 3, "Margin", self.lbl_margin)
+        self._add_metric(grid, 4, "State", self.lbl_state)
+        self._add_metric(grid, 5, "Source", self.lbl_source)
+        self._add_metric(grid, 6, "Predictions", self.lbl_count)
+        self._add_metric(grid, 7, "Cooldown", self.lbl_cooldown)
 
         self.lbl_top = QtWidgets.QLabel("-")
         self.lbl_top.setWordWrap(True)
@@ -488,11 +776,20 @@ class InferenceStatusWindow:
         self.lbl_threshold.setText(f"{state.get('threshold', 0.0):.1f}")
         self.lbl_confidence.setText(f"{confidence * 100:.1f}%")
         self.lbl_margin.setText(f"{margin * 100:.1f}%")
+        self.lbl_state.setText(state_type)
+        self.lbl_source.setText(state.get("source", "-"))
+        self.lbl_count.setText(str(state.get("count", self.engine.prediction_count)))
+        self.lbl_cooldown.setText(str(state.get("cooldown", 0)))
         self.lbl_top.setText(f"Top candidates: {state.get('top', '-')}")
 
-        if state_type == "calibrating":
+        if state_type in {"calibrating", "active_calibrating"}:
             self.progress.setValue(progress)
             self.progress.setFormat("Calibrating %p%")
+        elif state_type == "end":
+            self.progress.setValue(100)
+            self.progress.setFormat("Finished")
+            self.timer.stop()
+            self.engine.logger.close()
         else:
             self.progress.setValue(100)
             self.progress.setFormat("Ready")
@@ -521,6 +818,7 @@ def run_gui(args):
     engine = EMGRealTimeInference(args)
     engine.wait_for_connection()
     window = InferenceStatusWindow(engine)
+    app.aboutToQuit.connect(engine.logger.close)
     window.show(args.gui_interval_ms)
     app.exec_()
 
@@ -555,7 +853,29 @@ def parse_args():
     parser.add_argument("--gui", action="store_true", default=INFERENCE_GUI)
     parser.add_argument("--no-gui", action="store_false", dest="gui")
     parser.add_argument("--gui-interval-ms", type=int, default=INFERENCE_GUI_INTERVAL_MS)
-    return parser.parse_args()
+    parser.add_argument("--log", action="store_true", default=INFERENCE_LOG_ENABLED)
+    parser.add_argument("--no-log", action="store_false", dest="log")
+    parser.add_argument("--log-dir", default=INFERENCE_LOG_DIR)
+    parser.add_argument("--log-all-states", action="store_true", default=INFERENCE_LOG_ALL_STATES)
+    parser.add_argument("--log-events-only", action="store_false", dest="log_all_states")
+    parser.add_argument("--calibration-mode", action="store_true", default=INFERENCE_CALIBRATION_MODE)
+    parser.add_argument("--no-calibration-mode", action="store_false", dest="calibration_mode")
+    parser.add_argument("--calibration-only", action="store_true", default=INFERENCE_CALIBRATION_ONLY)
+    parser.add_argument(
+        "--active-calibration-seconds",
+        type=float,
+        default=INFERENCE_ACTIVE_CALIBRATION_SECONDS,
+    )
+    parser.add_argument("--replay-csv", default=INFERENCE_REPLAY_CSV)
+    parser.add_argument("--replay-loop", action="store_true", default=INFERENCE_REPLAY_LOOP)
+    parser.add_argument("--no-replay-loop", action="store_false", dest="replay_loop")
+    parser.add_argument("--replay-realtime", action="store_true", default=INFERENCE_REPLAY_REALTIME)
+    parser.add_argument("--no-replay-realtime", action="store_false", dest="replay_realtime")
+    parser.add_argument("--replay-speed", type=float, default=INFERENCE_REPLAY_SPEED)
+    args = parser.parse_args()
+    if args.buffer_size < args.window_size:
+        parser.error("--buffer-size must be greater than or equal to --window-size")
+    return args
 
 
 if __name__ == "__main__":

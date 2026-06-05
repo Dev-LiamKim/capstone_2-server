@@ -9,6 +9,7 @@ venv/
 .venv/
 
 # Local generated artifacts
+inference_logs/
 *.npy
 *.pt
 *.keras
