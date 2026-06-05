@@ -38,6 +38,7 @@ if DEVICE.type == 'cuda':
 
 
 def set_seed(seed=42):
+    """데이터 분할, 증강, 모델 초기화를 최대한 재현 가능하게 고정합니다."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -59,13 +60,20 @@ def extract_windows_from_df(
     notch_f0=60.0,
     notch_q=30.0
 ):
-    """이벤트 마커 기준 PRE_EVENT 이전 ~ POST_EVENT 이후 윈도우 추출"""
+    """이벤트 마커 기준 PRE_EVENT 이전 ~ POST_EVENT 이후 윈도우 추출.
+
+    align_peak=True이면 이벤트 마커 주변에서 에너지가 가장 큰 지점을 다시 찾아
+    window 중심으로 사용합니다. 키 입력 이벤트와 실제 근수축 피크 사이의 작은
+    시간 차이를 보정하기 위한 실험 옵션입니다.
+    """
     ch_cols = [f"CH{i}" for i in range(NUM_CHANNELS)]
     signal  = df[ch_cols].values
     if notch_filter and filter_mode == 'raw':
         filter_mode = 'notch'
 
     if filter_mode != 'raw':
+        # 학습 전처리는 CSV 전체 세션에 offline으로 적용합니다.
+        # 실시간 추론의 StreamingFilter는 batch 사이 filter state를 유지하는 방식입니다.
         signal = signal.astype(np.float64)
         if filter_mode == 'notch':
             b, a = scipy_signal.iirnotch(notch_f0, notch_q, fs=fs)
@@ -305,6 +313,8 @@ class CNNLSTM(nn.Module):
 
 
 class ResidualBlock1D(nn.Module):
+    """ResNet1D에서 사용하는 skip connection 블록."""
+
     def __init__(self, channels, dropout=0.2):
         super().__init__()
         self.block = nn.Sequential(
@@ -318,10 +328,13 @@ class ResidualBlock1D(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, x):
+        # 입력 x를 block 출력에 더해 깊은 모델의 학습 안정성을 높입니다.
         return self.relu(x + self.block(x))
 
 
 class ResNet1D(nn.Module):
+    """CNNLSTM과 비교하기 위한 1D ResNet 대안 모델."""
+
     def __init__(self, num_channels, num_classes):
         super().__init__()
         self.stem = nn.Sequential(
@@ -353,6 +366,8 @@ class ResNet1D(nn.Module):
 # 7. EarlyStopping (최적 가중치 자동 저장)
 # ==============================================================================
 class EarlyStopping:
+    """validation loss가 개선될 때만 best_emg_model.pt를 갱신합니다."""
+
     def __init__(self, patience=15, path='best_emg_model.pt'):
         self.patience   = patience
         self.path       = path
@@ -499,7 +514,7 @@ def plot_confusion_matrix(cm, class_names, save_path):
 def save_text_report(class_names, y_true, y_pred,
                      test_loss, test_acc, history,
                      dataset_info, save_path):
-    """학습 요약 + 클래스별 F1 리포트를 텍스트 파일로 저장"""
+    """실험 조건, 전체 성능, 클래스별 F1 리포트를 텍스트 파일로 저장합니다."""
     lines = []
     lines.append("=" * 60)
     lines.append("   EMG 키보드 분류 모델 학습 결과 리포트")

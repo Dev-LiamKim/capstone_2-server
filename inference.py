@@ -56,6 +56,12 @@ NUM_CLASSES = len(set(RIGHT_HAND_KEYS.values()))
 
 
 class ReplayEMGReceiver:
+    """CSV 파일을 센서 입력처럼 batch 단위로 재생하는 입력 소스.
+
+    network.py를 거치지 않고 inference.py 내부에서 직접 데이터를 공급합니다.
+    모델/threshold/smoothing/GUI/logging을 빠르게 확인할 때 사용합니다.
+    """
+
     def __init__(self, csv_path, sample_rate, speed=1.0, loop=False, realtime=True):
         self.csv_path = csv_path
         self.sample_rate = sample_rate
@@ -92,6 +98,7 @@ class ReplayEMGReceiver:
             self.last_emit = None
 
         if self.realtime:
+            # 실제 샘플링 속도를 흉내 내기 위해 batch 간격만큼 대기합니다.
             now = time.time()
             if self.last_emit is not None:
                 target_interval = (BATCH_SIZE / self.sample_rate) / self.speed
@@ -100,12 +107,19 @@ class ReplayEMGReceiver:
                     time.sleep(target_interval - elapsed)
             self.last_emit = time.time()
 
+        # EMGReceiver.receive_batch()와 동일하게 (channel, batch) 형태로 반환합니다.
         batch = self.samples[self.cursor : self.cursor + BATCH_SIZE].T
         self.cursor += BATCH_SIZE
         return batch
 
 
 class InferenceLogger:
+    """실시간 추론 상태를 CSV로 남기는 로거.
+
+    predict만 남기면 오탐/미탐 원인 분석이 어렵기 때문에 기본값은 idle,
+    skip, pending, cooldown까지 모두 저장하도록 되어 있습니다.
+    """
+
     def __init__(self, enabled, log_dir, log_all_states, source_name):
         self.enabled = enabled
         self.log_all_states = log_all_states
@@ -177,6 +191,8 @@ class InferenceLogger:
 
 
 class ThresholdCalibrator:
+    """초기 안정 상태 RMS로 trigger threshold를 자동 계산합니다."""
+
     def __init__(self, enabled, duration_sec, multiplier, fallback_threshold):
         self.enabled = enabled and duration_sec > 0
         self.duration_sec = duration_sec
@@ -206,6 +222,7 @@ class ThresholdCalibrator:
                 "min": float(np.min(self.samples)),
                 "max": float(np.max(self.samples)),
             }
+            # 안정 상태 평균에서 표준편차의 multiplier배만큼 떨어진 값을 입력 감지 기준으로 사용합니다.
             self.threshold = mean + self.multiplier * std
             self.done = True
             print(
@@ -223,6 +240,12 @@ class ThresholdCalibrator:
 
 
 class PredictionSmoother:
+    """단일 모델 출력이 바로 키 입력으로 나가지 않도록 안정화합니다.
+
+    confidence, top1-top2 margin, 최근 vote window를 모두 통과해야 최종 예측을
+    출력합니다. 실시간 키 입력에서는 중복/오탐을 줄이는 역할이 큽니다.
+    """
+
     def __init__(self, min_confidence, min_margin, vote_window, min_votes):
         self.min_confidence = min_confidence
         self.min_margin = min_margin
@@ -265,6 +288,12 @@ class PredictionSmoother:
 
 
 class StreamingFilter:
+    """실시간 batch에 순차적으로 적용하는 streaming filter.
+
+    train.py의 offline filter와 달리, 실시간에서는 이전 batch의 filter state를
+    보존해야 신호가 끊기지 않습니다.
+    """
+
     def __init__(self, mode, fs):
         self.mode = mode
         self.fs = fs
@@ -296,6 +325,7 @@ class StreamingFilter:
         for ch_idx in range(CHANNELS):
             x = batch[ch_idx].astype(np.float64)
             for filter_idx, (b, a) in enumerate(self.filters):
+                # lfilter 상태를 채널/필터별로 유지해서 batch 경계의 왜곡을 줄입니다.
                 x, self.states[ch_idx][filter_idx] = signal.lfilter(
                     b,
                     a,
@@ -307,10 +337,13 @@ class StreamingFilter:
 
 
 class EMGRealTimeInference:
+    """실시간 EMG 수신부터 예측 출력까지 담당하는 메인 엔진."""
+
     def __init__(self, args):
         self.args = args
         self.device = self._select_device(args.device)
         if args.replay_csv:
+            # replay_csv가 있으면 TCP 대신 CSV 입력을 사용합니다.
             self.receiver = ReplayEMGReceiver(
                 csv_path=args.replay_csv,
                 sample_rate=args.sample_rate,
@@ -320,6 +353,7 @@ class EMGRealTimeInference:
             )
             self.source_name = "replay"
         else:
+            # 실제 센서 또는 esp32-simulator.py는 이 TCP receiver로 들어옵니다.
             self.receiver = EMGReceiver(args.port)
             self.source_name = "tcp"
         self.model = self._load_model(args.model_path, args.model)
@@ -329,6 +363,7 @@ class EMGRealTimeInference:
         self.idx_to_label = {idx: raw_id for idx, raw_id in enumerate(self.raw_labels)}
         self.inv_keys = {v: k for k, v in RIGHT_HAND_KEYS.items()}
 
+        # 최근 신호를 rolling buffer에 유지하고, trigger가 발생하면 마지막 window를 잘라 추론합니다.
         self.data_buffer = np.zeros((CHANNELS, args.buffer_size), dtype=np.float32)
         self.filter = StreamingFilter(args.filter_mode, args.sample_rate)
         self.calibrator = ThresholdCalibrator(
@@ -413,6 +448,7 @@ class EMGRealTimeInference:
         return self.connected_addr
 
     def process_once(self):
+        # GUI timer와 CLI loop가 공통으로 호출하는 한 batch 처리 단위입니다.
         try:
             batch = self.receiver.receive_batch()
         except EOFError:
@@ -475,6 +511,7 @@ class EMGRealTimeInference:
                 }
             )
 
+        # threshold를 넘은 batch만 모델에 넣고, smoother가 최종 출력 여부를 결정합니다.
         candidate = self._classify(recent_rms)
         decision = self.smoother.update(candidate)
         return self._set_status(self._handle_decision(decision, recent_rms))
@@ -503,6 +540,7 @@ class EMGRealTimeInference:
             self.last_rms_log = now
 
     def _process_active_calibration(self, recent_rms):
+        # idle threshold 보정 이후 실제 키 입력을 받아 추천 confidence/margin을 계산합니다.
         now = time.time()
         if self.active_calibration_started_at is None:
             self.active_calibration_started_at = now
@@ -588,6 +626,7 @@ class EMGRealTimeInference:
         )
 
     def _classify(self, recent_rms):
+        # 학습 때와 동일하게 (time, channel) window를 만들고 channel별 표준화 후 모델에 입력합니다.
         window = self.data_buffer[:, -self.args.window_size:].T
         x = self._normalize_window(window)
         x_tensor = torch.from_numpy(x[None, :, :]).float().to(self.device)
