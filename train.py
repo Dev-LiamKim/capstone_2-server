@@ -207,42 +207,101 @@ def augment_emg(X, y, noise_std=0.05, max_shift=5, scale_range=(0.9, 1.1), aug_f
     perm  = rng.permutation(len(X_aug))
     return X_aug[perm], y_aug[perm]
 
+FINGER_MAPPING = {
+    'Thumb':  [' '],
+    'Index':  ['y', 'h', 'n', 'u', 'j', 'm'],
+    'Middle': ['i', 'k', ','],
+    'Ring':   ['o', 'l', '.'],
+    'Pinky':  ['p', '[', ']', '\\', ';', "'", '/']
+}
 
-# ==============================================================================
-# 4. 전처리 파이프라인 (분할 → 정규화 → 증강)
-# ==============================================================================
-def preprocess(
-    dataset_dir='dataset',
+# 함수 외부 전역 공간에 반드시 위치해야 함
+KEY_TO_FINGER = {}
+for finger, keys in FINGER_MAPPING.items():
+    for key in keys:
+        KEY_TO_FINGER[key] = finger
+
+def process_file_list(
+    file_list,
     notch_filter=False,
     filter_mode='raw',
     align_peak=False,
     peak_search_before=80,
     peak_search_after=120
 ):
-    X_all, y_all = load_dataset(
-        dataset_dir,
-        notch_filter=notch_filter,
-        filter_mode=filter_mode,
-        align_peak=align_peak,
-        peak_search_before=peak_search_before,
-        peak_search_after=peak_search_after
-    )
+    """주어진 CSV 파일 리스트 단위로 데이터를 추출하고 세션 정규화를 적용"""
+    X_all, y_all = [], []
+    for path in file_list:
+        df = pd.read_csv(path)
+        X, y = extract_windows_from_df(
+            df,
+            notch_filter=notch_filter,
+            filter_mode=filter_mode,
+            align_peak=align_peak,
+            peak_search_before=peak_search_before,
+            peak_search_after=peak_search_after
+        )
+        if len(X) == 0:
+            print(f"  [WARN] {os.path.basename(path)}: 유효한 윈도우 없음, 건너뜀")
+            continue
+            
+        # 세션별 정규화
+        sess_mean = X.mean(axis=(0, 1), keepdims=True)
+        sess_std  = X.std(axis=(0, 1),  keepdims=True) + 1e-8
+        X = (X - sess_mean) / sess_std
 
-    # 3-way stratified split: 70% / 15% / 15%
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X_all, y_all, test_size=0.30, random_state=42, stratify=y_all
-    )
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp
-    )
+        X_all.append(X)
+        y_all.append(y)
+        print(f"  [OK] {os.path.basename(path)}: {len(X)}개 윈도우 추출 완료")
 
-    # 세션별 정규화가 load_dataset()에서 이미 적용됐으므로 전역 정규화 불필요
+    if not X_all:
+        return np.array([]), np.array([])
+        
+    return np.concatenate(X_all, axis=0), np.concatenate(y_all, axis=0)
 
-    # 증강: train set에만 적용
-    X_train, y_train = augment_emg(X_train, y_train, aug_factor=3)
+# ==============================================================================
+# 4. 전처리 파이프라인 (분할 → 정규화 → 증강)
+# ==============================================================================
+def preprocess(
+    dataset_dir='dataset',
+    seed=42,
+    notch_filter=False,
+    filter_mode='raw',
+    align_peak=False,
+    peak_search_before=80,
+    peak_search_after=120
+):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    dataset_dir = os.path.join(base_dir, dataset_dir)
+    csv_files = sorted(glob.glob(os.path.join(dataset_dir, '*.csv')))
+    
+    if len(csv_files) < 3:
+        raise ValueError(f"[ERROR] Session-wise 분할을 위해 최소 3개 이상의 CSV 파일이 필요함. (발견: {len(csv_files)}개)")
 
-    print(f"[SPLIT+AUG] Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
-    return X_train, X_val, X_test, y_train, y_val, y_test
+    # 1. 파일 목록 분할 (10개 기준 -> Train 8 : Temp 2)
+    train_files, temp_files = train_test_split(csv_files, test_size=0.2, random_state=seed)
+    
+    # 2. Temp를 다시 반분 (Temp 2 -> Val 1 : Test 1)
+    val_files, test_files = train_test_split(temp_files, test_size=0.5, random_state=seed)
+
+    print(f"\n[FILE SPLIT] Train: {len(train_files)}개 | Val: {len(val_files)}개 | Test: {len(test_files)}개")
+
+    print("\n[PROCESS] Train 데이터 추출 중...")
+    X_train, y_train = process_file_list(train_files, notch_filter, filter_mode, align_peak, peak_search_before, peak_search_after)
+    
+    print("\n[PROCESS] Val 데이터 추출 중...")
+    X_val, y_val = process_file_list(val_files, notch_filter, filter_mode, align_peak, peak_search_before, peak_search_after)
+    
+    print("\n[PROCESS] Test 데이터 추출 중...")
+    X_test, y_test = process_file_list(test_files, notch_filter, filter_mode, align_peak, peak_search_before, peak_search_after)
+
+    # Train 데이터에만 증강 적용
+    if len(X_train) > 0:
+        X_train, y_train = augment_emg(X_train, y_train, aug_factor=3)
+
+    file_counts = (len(train_files), len(val_files), len(test_files))
+    return X_train, X_val, X_test, y_train, y_val, y_test, file_counts
+
 
 
 # ==============================================================================
@@ -330,6 +389,80 @@ class ResidualBlock1D(nn.Module):
     def forward(self, x):
         # 입력 x를 block 출력에 더해 깊은 모델의 학습 안정성을 높입니다.
         return self.relu(x + self.block(x))
+
+# ==============================================================================
+# 12-2. 동일/이전 손가락 간 성능 분석 및 저장
+# ==============================================================================
+def analyze_finger_performance(cm, class_names, save_dir):
+    """혼동 행렬 기반 동일 손가락 및 타 손가락 분류 오차 분석"""
+    num_classes = len(class_names)
+    
+    # 1. 원본 수치 행렬 생성
+    finger_cm = np.zeros((num_classes, num_classes))
+    for i in range(num_classes):
+        row_sum = np.sum(cm[i]) if np.sum(cm[i]) > 0 else 1
+        finger_cm[i] = cm[i] / row_sum  # 행 정규화 비율 수치 활용
+        
+    same_finger_scores = []
+    diff_finger_scores = []
+    
+    # 클래스 쌍 조합 반복 탐색
+    for i, src_key in enumerate(class_names):
+        src_finger = KEY_TO_FINGER.get(src_key, 'Unknown')
+        
+        for j, tgt_key in enumerate(class_names):
+            if i == j:
+                continue # 정답 예측 제외
+                
+            tgt_finger = KEY_TO_FINGER.get(tgt_key, 'Unknown')
+            val = finger_cm[i, j]
+            
+            if src_finger == tgt_finger:
+                same_finger_scores.append(val)
+            else:
+                diff_finger_scores.append(val)
+
+    # 2. 결과 표(텍스트 요약본) 구성 및 출력
+    avg_same = np.mean(same_finger_scores) * 100 if same_finger_scores else 0.0
+    avg_diff = np.mean(diff_finger_scores) * 100 if diff_finger_scores else 0.0
+    
+    summary_lines = [
+        "\n" + "="*50,
+        " [손가락별 동적 변별력 오류 요약 표]",
+        "-"*50,
+        f" 동일 손가락 내 자판간 오분류 비율 평균 : {avg_same:.2f}%",
+        f" 타 손가락 자판간 오분류 비율 평균     : {avg_diff:.2f}%",
+        "="*50,
+        " * 분석 결과 해석: 동일 손가락 수치가 높을수록 해당 손가락의",
+        "   미세 근전도 신호 패턴 간 유사도가 높아 독립 변별이 어려움을 뜻함.",
+        "="*50
+    ]
+    summary_text = "\n".join(summary_lines)
+    print(summary_text)
+    
+    with open(os.path.join(save_dir, 'finger_analysis_table.txt'), 'w', encoding='utf-8') as f:
+        f.write(summary_text)
+
+    # 3. 데이터 시각화 (막대그래프) 생성
+    plt.figure(figsize=(6, 5))
+    categories = ['Same Finger', 'Different Finger']
+    values = [avg_same, avg_diff]
+    colors = ['#ff7f0e', '#1f77b4']
+    
+    bars = plt.bar(categories, values, color=colors, width=0.5)
+    plt.ylabel('Average Misclassification Rate (%)', fontsize=11)
+    plt.title('Error Distribution: Same vs Diff Finger', fontsize=12)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # 막대 위 수치 표기
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2.0, height + 0.5, f'{height:.2f}%', ha='center', va='bottom', fontweight='bold')
+        
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'finger_error_comparison.png'), dpi=150)
+    plt.close()
+    print(f"[SAVED] 손가락 비교 그래프: {os.path.join(save_dir, 'finger_error_comparison.png')}")
 
 
 class ResNet1D(nn.Module):
@@ -638,8 +771,9 @@ if __name__ == '__main__':
     POST_EVENT = WINDOW_SIZE - PRE_EVENT
 
     # ── 데이터 준비 ─────────────────────────────────────────────────────────
-    X_train, X_val, X_test, y_train, y_val, y_test = preprocess(
+    X_train, X_val, X_test, y_train, y_val, y_test, split_counts = preprocess(
         args.dataset_dir,
+        seed=args.seed,
         notch_filter=args.notch_filter,
         filter_mode=args.filter_mode,
         align_peak=args.align_peak,
@@ -724,6 +858,7 @@ if __name__ == '__main__':
 
     dataset_info = {
         'Dataset directory       ': args.dataset_dir,
+        'Split Strategy          ': f'Session-wise (Train {split_counts[0]} / Val {split_counts[1]} / Test {split_counts[2]} files)',
         'Preprocessing           ': 'notch' if args.notch_filter and args.filter_mode == 'raw' else args.filter_mode,
         'Peak alignment          ': 'on' if args.align_peak else 'off',
         'Peak search before/after': f'{args.peak_search_before}/{args.peak_search_after}',
@@ -742,9 +877,13 @@ if __name__ == '__main__':
     # ② 에포크 로그 CSV
     save_epoch_log(history,
                    save_path=os.path.join(results_dir, 'training_log.csv'))
+    
+    analyze_finger_performance(cm, class_names, save_dir=results_dir)
     # ③ 혼동 행렬
     plot_confusion_matrix(cm, class_names,
                           save_path=os.path.join(results_dir, 'confusion_matrix.png'))
+    
+    
     # ④ 텍스트 요약 리포트
     save_text_report(class_names, y_true, y_pred,
                      test_loss, test_acc, history,
@@ -752,3 +891,5 @@ if __name__ == '__main__':
                      save_path=os.path.join(results_dir, 'report.txt'))
 
     print(f"\n[SUCCESS] 학습 완료 - 'best_emg_model.pt' 및 {results_dir}/ 저장됨")
+    
+    
