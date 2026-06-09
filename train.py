@@ -137,13 +137,14 @@ def load_dataset(
     # 스크립트 파일 위치 기준으로 절대경로 변환 (cwd에 무관하게 동작)
     base_dir = os.path.dirname(os.path.abspath(__file__))
     dataset_dir = os.path.join(base_dir, dataset_dir)
-    csv_files = glob.glob(os.path.join(dataset_dir, '*.csv'))
+    csv_files = sorted(glob.glob(os.path.join(dataset_dir, '*.csv')))
     if not csv_files:
         raise FileNotFoundError(f"[ERROR] '{dataset_dir}/' 에서 CSV 파일을 찾을 수 없습니다.")
 
     print(f"[LOAD] 발견된 CSV 파일: {len(csv_files)}개")
-    X_all, y_all = [], []
-    for path in csv_files:
+    X_all, y_all, session_ids = [], [], []
+    session_names = []
+    for session_idx, path in enumerate(csv_files):
         df = pd.read_csv(path)
         X, y = extract_windows_from_df(
             df,
@@ -164,12 +165,16 @@ def load_dataset(
 
         X_all.append(X)
         y_all.append(y)
-        print(f"  [OK] {os.path.basename(path)}: {len(X)}개 윈도우 추출 (세션 정규화 완료)")
+        session_ids.append(np.full(len(X), session_idx, dtype=np.int32))
+        session_name = os.path.basename(path)
+        session_names.append(session_name)
+        print(f"  [OK] {session_name}: {len(X)}개 윈도우 추출 (세션 정규화 완료)")
 
     X_all = np.concatenate(X_all, axis=0)
     y_all = np.concatenate(y_all, axis=0)
+    session_ids = np.concatenate(session_ids, axis=0)
     print(f"[DATASET] 전체 샘플 수: {len(X_all)}")
-    return X_all, y_all
+    return X_all, y_all, session_ids, session_names
 
 
 # ==============================================================================
@@ -269,39 +274,85 @@ def preprocess(
     filter_mode='raw',
     align_peak=False,
     peak_search_before=80,
-    peak_search_after=120
+    peak_search_after=120,
+    split_mode='random'
 ):
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    dataset_dir = os.path.join(base_dir, dataset_dir)
-    csv_files = sorted(glob.glob(os.path.join(dataset_dir, '*.csv')))
-    
-    if len(csv_files) < 3:
-        raise ValueError(f"[ERROR] Session-wise 분할을 위해 최소 3개 이상의 CSV 파일이 필요함. (발견: {len(csv_files)}개)")
+    X_all, y_all, session_ids, session_names = load_dataset(
+        dataset_dir,
+        notch_filter=notch_filter,
+        filter_mode=filter_mode,
+        align_peak=align_peak,
+        peak_search_before=peak_search_before,
+        peak_search_after=peak_search_after
+    )
 
-    # 1. 파일 목록 분할 (10개 기준 -> Train 8 : Temp 2)
-    train_files, temp_files = train_test_split(csv_files, test_size=0.2, random_state=seed)
-    
-    # 2. Temp를 다시 반분 (Temp 2 -> Val 1 : Test 1)
-    val_files, test_files = train_test_split(temp_files, test_size=0.5, random_state=seed)
+    split_info = {
+        'mode': split_mode,
+        'train_sessions': '-',
+        'val_sessions': '-',
+        'test_sessions': '-',
+    }
 
-    print(f"\n[FILE SPLIT] Train: {len(train_files)}개 | Val: {len(val_files)}개 | Test: {len(test_files)}개")
+    if split_mode == 'random':
+        X_train, X_temp, y_train, y_temp = train_test_split(
+            X_all, y_all, test_size=0.30, random_state=seed, stratify=y_all
+        )
+        X_val, X_test, y_val, y_test = train_test_split(
+            X_temp, y_temp, test_size=0.50, random_state=seed, stratify=y_temp
+        )
+    elif split_mode == 'session':
+        unique_session_ids = np.arange(len(session_names))
+        if len(unique_session_ids) < 4:
+            raise ValueError("--split-mode session requires at least 4 valid CSV sessions.")
 
-    print("\n[PROCESS] Train 데이터 추출 중...")
-    X_train, y_train = process_file_list(train_files, notch_filter, filter_mode, align_peak, peak_search_before, peak_search_after)
-    
-    print("\n[PROCESS] Val 데이터 추출 중...")
-    X_val, y_val = process_file_list(val_files, notch_filter, filter_mode, align_peak, peak_search_before, peak_search_after)
-    
-    print("\n[PROCESS] Test 데이터 추출 중...")
-    X_test, y_test = process_file_list(test_files, notch_filter, filter_mode, align_peak, peak_search_before, peak_search_after)
+        train_sessions, temp_sessions = train_test_split(
+            unique_session_ids, test_size=0.30, random_state=seed, shuffle=True
+        )
+        val_sessions, test_sessions = train_test_split(
+            temp_sessions, test_size=0.50, random_state=seed, shuffle=True
+        )
+
+        train_mask = np.isin(session_ids, train_sessions)
+        val_mask = np.isin(session_ids, val_sessions)
+        test_mask = np.isin(session_ids, test_sessions)
+
+        X_train, y_train = X_all[train_mask], y_all[train_mask]
+        X_val, y_val = X_all[val_mask], y_all[val_mask]
+        X_test, y_test = X_all[test_mask], y_all[test_mask]
+
+        split_info.update({
+            'train_sessions': ', '.join(session_names[i] for i in train_sessions),
+            'val_sessions': ', '.join(session_names[i] for i in val_sessions),
+            'test_sessions': ', '.join(session_names[i] for i in test_sessions),
+        })
+        print("[SESSION SPLIT]")
+        print(f"  Train sessions: {split_info['train_sessions']}")
+        print(f"  Val sessions  : {split_info['val_sessions']}")
+        print(f"  Test sessions : {split_info['test_sessions']}")
+        _warn_missing_classes(y_train, y_val, y_test)
+    else:
+        raise ValueError(f"Unsupported split_mode: {split_mode}")
 
     # Train 데이터에만 증강 적용
     if len(X_train) > 0:
         X_train, y_train = augment_emg(X_train, y_train, aug_factor=3)
 
-    file_counts = (len(train_files), len(val_files), len(test_files))
-    return X_train, X_val, X_test, y_train, y_val, y_test, file_counts
+    print(f"[SPLIT+AUG] Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+    return X_train, X_val, X_test, y_train, y_val, y_test, split_info
 
+
+def _warn_missing_classes(y_train, y_val, y_test):
+    split_labels = {
+        'train': set(y_train.tolist()),
+        'val': set(y_val.tolist()),
+        'test': set(y_test.tolist()),
+    }
+    expected = set(range(NUM_CLASSES))
+    for split_name, labels in split_labels.items():
+        missing = sorted(expected - labels)
+        if missing:
+            missing_keys = [str(idx_to_label[idx]) for idx in missing]
+            print(f"  [WARN] {split_name} split missing classes: {', '.join(missing_keys)}")
 
 
 # ==============================================================================
@@ -499,7 +550,7 @@ class ResNet1D(nn.Module):
 # 7. EarlyStopping (최적 가중치 자동 저장)
 # ==============================================================================
 class EarlyStopping:
-    """validation loss가 개선될 때만 best_emg_model.pt를 갱신합니다."""
+    """validation loss가 개선될 때만 지정된 모델 파일을 갱신합니다."""
 
     def __init__(self, patience=15, path='best_emg_model.pt'):
         self.patience   = patience
@@ -676,7 +727,13 @@ def save_text_report(class_names, y_true, y_pred,
     lines.append(f"  Test Accuracy  : {test_acc*100:.2f}%")
 
     lines.append("\n[클래스별 성능 (Test Set)]")
-    report = classification_report(y_true, y_pred, target_names=class_names)
+    report = classification_report(
+        y_true,
+        y_pred,
+        labels=list(range(NUM_CLASSES)),
+        target_names=class_names,
+        zero_division=0,
+    )
     lines.append(report)
 
     text = "\n".join(lines)
@@ -737,6 +794,12 @@ if __name__ == '__main__':
         help='Random seed for model initialization and data loading. Defaults to 42.'
     )
     parser.add_argument(
+        '--split-mode',
+        choices=['random', 'session'],
+        default='random',
+        help='Data split strategy. random keeps the previous stratified window split; session holds out CSV recordings.'
+    )
+    parser.add_argument(
         '--window-size',
         type=int,
         default=WINDOW_SIZE,
@@ -760,6 +823,11 @@ if __name__ == '__main__':
         default=15,
         help='Early stopping patience. Defaults to 15.'
     )
+    parser.add_argument(
+        '--model-output',
+        default='best_emg_model.pt',
+        help='Path to save the best model weights. Defaults to best_emg_model.pt.'
+    )
     args = parser.parse_args()
     set_seed(args.seed)
 
@@ -771,14 +839,15 @@ if __name__ == '__main__':
     POST_EVENT = WINDOW_SIZE - PRE_EVENT
 
     # ── 데이터 준비 ─────────────────────────────────────────────────────────
-    X_train, X_val, X_test, y_train, y_val, y_test, split_counts = preprocess(
+    X_train, X_val, X_test, y_train, y_val, y_test, split_info = preprocess(
         args.dataset_dir,
-        seed=args.seed,
         notch_filter=args.notch_filter,
         filter_mode=args.filter_mode,
         align_peak=args.align_peak,
         peak_search_before=args.peak_search_before,
-        peak_search_after=args.peak_search_after
+        peak_search_after=args.peak_search_after,
+        split_mode=args.split_mode,
+        seed=args.seed
     )
 
     pin = (DEVICE.type == 'cuda')
@@ -803,7 +872,7 @@ if __name__ == '__main__':
                     optimizer, factor=0.5, patience=7, min_lr=1e-5)
     # GradScaler: Mixed Precision 학습 시 수치 안정성 보장
     scaler    = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == 'cuda'))
-    early_stopping = EarlyStopping(patience=args.patience)
+    early_stopping = EarlyStopping(patience=args.patience, path=args.model_output)
 
     print(f"\n[MODEL] 파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -838,7 +907,7 @@ if __name__ == '__main__':
 
     # ── 최적 모델 로드 후 Test 평가 ───────────────────────────────────────
     model.load_state_dict(
-        torch.load('best_emg_model.pt', map_location=DEVICE, weights_only=True))
+        torch.load(args.model_output, map_location=DEVICE, weights_only=True))
     test_loss, test_acc = run_epoch(
         model, test_loader, criterion, None, scaler, DEVICE, is_train=False)
     print(f"\n[RESULT] Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc*100:.2f}%")
@@ -854,15 +923,19 @@ if __name__ == '__main__':
 
     # 예측값 수집
     y_true, y_pred = get_predictions(model, test_loader, DEVICE)
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
 
     dataset_info = {
         'Dataset directory       ': args.dataset_dir,
-        'Split Strategy          ': f'Session-wise (Train {split_counts[0]} / Val {split_counts[1]} / Test {split_counts[2]} files)',
         'Preprocessing           ': 'notch' if args.notch_filter and args.filter_mode == 'raw' else args.filter_mode,
         'Peak alignment          ': 'on' if args.align_peak else 'off',
         'Peak search before/after': f'{args.peak_search_before}/{args.peak_search_after}',
+        'Split mode              ': args.split_mode,
+        'Train sessions          ': split_info['train_sessions'],
+        'Val sessions            ': split_info['val_sessions'],
+        'Test sessions           ': split_info['test_sessions'],
         'Model                   ': args.model,
+        'Model output            ': args.model_output,
         'Seed                    ': args.seed,
         'Max epochs              ': args.max_epochs,
         'Patience                ': args.patience,
@@ -890,6 +963,4 @@ if __name__ == '__main__':
                      dataset_info,
                      save_path=os.path.join(results_dir, 'report.txt'))
 
-    print(f"\n[SUCCESS] 학습 완료 - 'best_emg_model.pt' 및 {results_dir}/ 저장됨")
-    
-    
+    print(f"\n[SUCCESS] 학습 완료 - '{args.model_output}' 및 {results_dir}/ 저장됨")

@@ -1,0 +1,66 @@
+============================================================
+   EMG 키보드 분류 모델 학습 결과 리포트
+============================================================
+
+[하이퍼파라미터]
+  WINDOW_SIZE  : 200 samples (~571ms @ 350Hz)
+  PRE_EVENT    : 80 / POST_EVENT : 120
+  BATCH_SIZE   : 64
+  NUM_CLASSES  : 19
+  NUM_CHANNELS : 8
+  Optimizer    : Adam (lr=1e-3)
+  Scheduler    : ReduceLROnPlateau (factor=0.5, patience=7)
+  EarlyStopping: patience=15
+  Augmentation : noise+shift+scale x3 (총 4배)
+
+[데이터셋]
+  Dataset directory       : new_dataset
+  Preprocessing           : highpass_20
+  Peak alignment          : off
+  Peak search before/after: 80/120
+  Split mode              : session
+  Train sessions          : recording_20260529_193249.csv, recording_20260530_075638.csv, recording_20260529_200900.csv, recording_20260530_082225.csv, recording_20260530_070412.csv, recording_20260529_203150.csv, recording_20260530_073846.csv
+  Val sessions            : recording_20260530_071510.csv
+  Test sessions           : recording_20260530_081021.csv, recording_20260529_195636.csv
+  Model                   : cnn_lstm
+  Model output            : best_emg_model_session.pt
+  Seed                    : 42
+  Max epochs              : 150
+  Patience                : 15
+  Train 샘플 수 (증강 후): 26448
+  Val 샘플 수             : 945
+  Test 샘플 수            : 1881
+
+[학습 결과]
+  총 에포크      : 40
+  Best Val Loss  : 0.5376
+  Best Val Acc   : 82.86%
+  Test Loss      : 0.6891
+  Test Accuracy  : 76.82%
+
+[클래스별 성능 (Test Set)]
+              precision    recall  f1-score   support
+
+           y       0.75      0.94      0.83       100
+           u       0.80      0.65      0.72        99
+           i       0.80      0.85      0.82        98
+           o       0.88      0.90      0.89        99
+           p       0.68      0.86      0.76       100
+           [       0.58      0.61      0.60        96
+           ]       0.59      0.61      0.60        99
+           \       0.89      0.68      0.77        99
+           h       0.76      0.76      0.76       100
+           j       0.67      0.81      0.73        99
+           k       0.66      0.57      0.61        99
+           l       0.78      0.78      0.78       100
+           ;       0.83      0.82      0.82       100
+           '       0.79      0.71      0.74        99
+           n       0.78      0.79      0.78        99
+           m       0.84      0.69      0.76       100
+           ,       0.87      0.79      0.83        99
+           .       0.86      0.90      0.88        99
+           /       0.87      0.89      0.88        97
+
+    accuracy                           0.77      1881
+   macro avg       0.77      0.77      0.77      1881
+weighted avg       0.77      0.77      0.77      1881
