@@ -384,8 +384,11 @@ class EMGRealTimeInference:
         self.idx_to_label = {idx: raw_id for idx, raw_id in enumerate(self.raw_labels)}
         self.inv_keys = {v: k for k, v in RIGHT_HAND_KEYS.items()}
 
-        # 최근 신호를 rolling buffer에 유지하고, trigger가 발생하면 마지막 window를 잘라 추론합니다.
+        # raw_buffer는 main.py의 RMS 표시 방식과 맞춘 trigger/calibration 계산에 사용합니다.
+        # data_buffer는 모델 입력용으로 filter가 적용된 신호를 유지합니다.
+        self.raw_buffer = np.zeros((CHANNELS, args.buffer_size), dtype=np.float32)
         self.data_buffer = np.zeros((CHANNELS, args.buffer_size), dtype=np.float32)
+        self.buffered_samples = 0
         self.filter = StreamingFilter(args.filter_mode, args.sample_rate)
         self.calibrator = ThresholdCalibrator(
             enabled=args.auto_threshold,
@@ -508,7 +511,8 @@ class EMGRealTimeInference:
         if samples is None or len(samples) < BATCH_SIZE:
             return None, None
 
-        threshold_filter = StreamingFilter(self.args.filter_mode, self.args.sample_rate)
+        temp_raw_buffer = np.zeros((CHANNELS, self.args.buffer_size), dtype=np.float32)
+        buffered_samples = 0
         rms_values = []
         active_flags = []
         events = getattr(self.receiver, "events", None)
@@ -516,8 +520,10 @@ class EMGRealTimeInference:
         usable = (len(samples) // BATCH_SIZE) * BATCH_SIZE
         for start in range(0, usable, BATCH_SIZE):
             batch = samples[start : start + BATCH_SIZE].T
-            processed = threshold_filter.process(batch)
-            rms_values.append(self._recent_rms(processed))
+            temp_raw_buffer = np.roll(temp_raw_buffer, -BATCH_SIZE, axis=1)
+            temp_raw_buffer[:, -BATCH_SIZE:] = batch
+            buffered_samples = min(buffered_samples + BATCH_SIZE, self.args.buffer_size)
+            rms_values.append(self._activity_rms_from_buffer(temp_raw_buffer, buffered_samples))
 
             if events is not None and len(events) >= start + BATCH_SIZE:
                 event_batch = events[start : start + BATCH_SIZE]
@@ -596,10 +602,11 @@ class EMGRealTimeInference:
         if batch is None:
             return None
 
+        self._append_raw_buffer(batch)
         processed_batch = self.filter.process(batch)
         self._append_buffer(processed_batch)
 
-        recent_rms = self._recent_rms(processed_batch)
+        recent_rms = self._activity_rms()
         self._maybe_log_rms(recent_rms)
         self.threshold = self.calibrator.update(recent_rms)
 
@@ -660,15 +667,47 @@ class EMGRealTimeInference:
         self.data_buffer = np.roll(self.data_buffer, -BATCH_SIZE, axis=1)
         self.data_buffer[:, -BATCH_SIZE:] = batch
 
+    def _append_raw_buffer(self, batch):
+        self.raw_buffer = np.roll(self.raw_buffer, -BATCH_SIZE, axis=1)
+        self.raw_buffer[:, -BATCH_SIZE:] = batch
+        self.buffered_samples = min(self.buffered_samples + BATCH_SIZE, self.args.buffer_size)
+
     def _recent_rms(self, batch):
         return float(np.sqrt(np.mean(np.square(batch))))
+
+    def _activity_rms(self):
+        return self._activity_rms_from_buffer(self.raw_buffer, self.buffered_samples)
+
+    def _activity_channel_rms(self):
+        return self._activity_channel_rms_from_buffer(self.raw_buffer, self.buffered_samples)
+
+    def _activity_rms_from_buffer(self, buffer, buffered_samples):
+        channel_rms = self._activity_channel_rms_from_buffer(buffer, buffered_samples)
+        if len(channel_rms) == 0:
+            return 0.0
+        # main.py는 채널별 RMS bar를 보여주므로, 실시간 trigger는 가장 강한 채널을 기준으로 잡습니다.
+        return float(np.max(channel_rms))
+
+    def _activity_channel_rms_from_buffer(self, buffer, buffered_samples):
+        valid_len = min(buffered_samples, buffer.shape[1])
+        if valid_len <= 0:
+            return np.array([], dtype=np.float32)
+
+        valid = buffer[:, -valid_len:]
+        baseline = np.mean(valid, axis=1, keepdims=True)
+        centered = valid - baseline
+        rms_len = min(100, valid_len)
+        recent = centered[:, -rms_len:]
+        return np.sqrt(np.mean(np.square(recent), axis=1))
 
     def _maybe_log_rms(self, recent_rms):
         if not self.args.print_rms:
             return
         now = time.time()
         if now - self.last_rms_log >= self.args.rms_log_interval:
-            print(f"[RMS] {recent_rms:.1f}")
+            channel_rms = self._activity_channel_rms()
+            channel_text = ", ".join(f"{value:.0f}" for value in channel_rms)
+            print(f"[RMS] max={recent_rms:.1f} ch=[{channel_text}]")
             self.last_rms_log = now
 
     def _process_active_calibration(self, recent_rms):
